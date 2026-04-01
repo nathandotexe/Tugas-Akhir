@@ -5,3 +5,4 @@ track_low_thresh: 0.1    # low confidence threshold for associating with an exis
 new_track_thresh: 0.6    # threshold for creating a new track from a low-confidence detection
 track_buffer: 30         # number of frames to buffer a lost track
 match_thresh: 0.8        # IoU threshold for matching tracks
+fuse_score: True         # fuse score with IoU distance
