@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from filterpy.kalman import KalmanFilter
 from ultralytics import YOLO
 import tkinter as tk
-
+from tkinter import filedialog, messagebox, ttk
 from flask import Flask, Response
 
 MODEL_PATH        = "Yolov11/best.pt"
@@ -22,6 +22,7 @@ LOG_EVERY_N       = 1
 SKIP_FRAMES       = 1
 CONF_THRESHOLD    = 0.35
 IOU_THRESHOLD     = 0.45
+MIN_BOX_AREA      = 100   # px² discard tiny/spurious detections
 
 CALIB_PATH        = "calib.npz"
 RTSP_URL          = "rtsp://localhost:8554/live"
@@ -461,14 +462,16 @@ class AsyncWriter:
 
 
 class TrackState:
-    __slots__ = ("kf","prev_t","prev_px","speed_buf","last_speed_ms",
+    __slots__ = ("kf","prev_t","prev_px","prev_wm","speed_buf","last_speed_ms",
                  "color","start_crossed","finish_crossed","total_dist",
-                 "last_seen_t","last_box","last_disp_kh")
+                 "last_seen_t","last_box","last_disp_kh",
+                 "roi_entry_t","roi_exit_t")
 
-    def __init__(self, kf, t, px, py, color, box):
+    def __init__(self, kf, t, px, py, wx_m, wy_m, color, box):
         self.kf             = kf
         self.prev_t         = t
         self.prev_px        = (px, py)
+        self.prev_wm        = (wx_m, wy_m)   # world-metre coords last frame
         self.speed_buf      = deque(maxlen=MEDIAN_WIN)
         self.last_speed_ms  = 0.0
         self.color          = color
@@ -478,6 +481,8 @@ class TrackState:
         self.last_seen_t    = t
         self.last_box       = box
         self.last_disp_kh   = 0.0
+        self.roi_entry_t    = t    # time this subject first entered the RoI
+        self.roi_exit_t     = None # time this subject left the RoI (None = still inside)
 
 
 def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time, out_path_dist):
@@ -485,48 +490,69 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
         print("No speed data."); return
     from scipy.ndimage import gaussian_filter1d
     n = len(speed_logs)
-    palette = plt.cm.tab10.colors
+    # Use tab20 so we have 20 distinct colours — enough for large groups
+    palette = plt.cm.tab20.colors
 
     for out_path, x_key, xlabel, title_suffix in [
         (out_path_time, "time", "Time (s)",     "Over Time"),
         (out_path_dist, "dist", "Distance (m)", "Over Distance"),
     ]:
-        fig, axes = plt.subplots(n, 1, figsize=(13, 3.8*n), squeeze=False)
+        row_h   = 3.5          # height per subplot row
+        fig_h   = row_h * n + 1.2   # +1.2 for suptitle headroom
+        fig, axes = plt.subplots(n, 1, figsize=(13, fig_h), squeeze=False)
         fig.suptitle(f"Athlete Speed Profiles ({title_suffix})",
-                     fontsize=16, fontweight="bold", y=1.01)
+                     fontsize=16, fontweight="bold")
 
-        for row, (tid, records) in zip(axes, sorted(speed_logs.items())):
-            ax = row[0]
+        for row_axes, (tid, records) in zip(axes, sorted(speed_logs.items())):
+            ax = row_axes[0]
             if len(records) < 3:
-                ax.set_title(f"ID {tid} -- insufficient data"); continue
+                ax.set_title(f"ID {tid} — insufficient data")
+                ax.set_visible(True)
+                continue
+
             ts   = np.array([r[0] for r in records])
             kmph = np.array([r[1] for r in records]) * 3.6
             ds   = np.array([r[2] if len(r) > 2 else 0.0 for r in records])
             xs   = ts if x_key == "time" else ds
             col  = palette[tid % len(palette)]
-            ax.plot(xs, kmph, color=col, alpha=0.2, linewidth=1)
-            smooth = gaussian_filter1d(kmph, sigma=4)
-            ax.plot(xs, smooth, color=col, linewidth=2.3, label=f"ID {tid} (km/h)")
 
+            # Sort by x-axis so the line never jumps backwards
+            order = np.argsort(xs)
+            xs_s, kmph_s = xs[order], kmph[order]
+
+            ax.plot(xs_s, kmph_s, color=col, alpha=0.2, linewidth=1)
+            smooth = gaussian_filter1d(kmph_s, sigma=4)
+            ax.plot(xs_s, smooth, color=col, linewidth=2.3, label=f"ID {tid}")
+
+            seen_start = seen_finish = False
             for st in start_events.get(tid, []):
-                xv = st if x_key == "time" else ds[np.searchsorted(ts, st)] if np.searchsorted(ts, st) < len(ds) else ds[-1]
-                ax.axvline(xv, color="lime", linestyle=":", linewidth=1.5, label="Start")
+                idx = np.searchsorted(ts, st)
+                xv  = st if x_key == "time" else (ds[min(idx, len(ds)-1)] if len(ds) else st)
+                ax.axvline(xv, color="lime", linestyle=":", linewidth=1.5,
+                           label="Start" if not seen_start else "_")
+                seen_start = True
             for ft in finish_events.get(tid, []):
-                xv = ft if x_key == "time" else ds[np.searchsorted(ts, ft)] if np.searchsorted(ts, ft) < len(ds) else ds[-1]
-                ax.axvline(xv, color="red", linestyle="--", linewidth=1.5, label="Finish")
+                idx = np.searchsorted(ts, ft)
+                xv  = ft if x_key == "time" else (ds[min(idx, len(ds)-1)] if len(ds) else ft)
+                ax.axvline(xv, color="red", linestyle="--", linewidth=1.5,
+                           label="Finish" if not seen_finish else "_")
+                seen_finish = True
 
-            pk = int(np.argmax(smooth))
-            ax.annotate(f"Peak {smooth[pk]:.1f} km/h", xy=(xs[pk], smooth[pk]),
-                        xytext=(xs[pk]+0.5, smooth[pk]+1.5), fontsize=8, color="darkred",
-                        arrowprops=dict(arrowstyle="->", color="darkred", lw=1.2))
-            ax.set_ylabel("Speed (km/h)"); ax.set_xlabel(xlabel)
+            if len(smooth) > 0:
+                pk = int(np.argmax(smooth))
+                ax.annotate(f"Peak {smooth[pk]:.1f} km/h",
+                            xy=(xs_s[pk], smooth[pk]),
+                            xytext=(xs_s[pk] + max((xs_s[-1]-xs_s[0])*0.02, 0.3),
+                                    smooth[pk] + 1.5),
+                            fontsize=8, color="darkred",
+                            arrowprops=dict(arrowstyle="->", color="darkred", lw=1.2))
+
+            ax.set_ylabel("Speed (km/h)")
+            ax.set_xlabel(xlabel)
             ax.set_title(f"ID {tid}  Peak:{max(kmph):.1f}  Avg:{np.mean(kmph):.1f} km/h")
-            ax.set_ylim(bottom=0); ax.grid(True, alpha=0.3)
-            h, l = ax.get_legend_handles_labels()
-            seen, uh, ul = set(), [], []
-            for hh, ll in zip(h, l):
-                if ll not in seen: seen.add(ll); uh.append(hh); ul.append(ll)
-            ax.legend(uh, ul, fontsize=8, loc="upper right")
+            ax.set_ylim(bottom=0)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, loc="upper right")
 
         plt.tight_layout()
         plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -591,6 +617,15 @@ def main():
     world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
     scale_m_per_w = distance_m / world_dist if world_dist > 0 and distance_m > 0 else 1.0
     print(f"  [Geometry] {distance_m}m = {world_dist:.2f} world units  (scale {scale_m_per_w:.4f} m/wu)")
+    # Sanity-check: print what 1 pixel of movement at the field centre implies in metres.
+    # If this looks wildly off (e.g. >0.5 m/px or <0.01 m/px) your H or scale is suspect.
+    cx_check = (corners[0][0] + corners[2][0]) / 2.0 if 'corners' in dir() else DISPLAY_SIZE[0] / 2
+    cy_check = (corners[0][1] + corners[2][1]) / 2.0 if 'corners' in dir() else DISPLAY_SIZE[1] / 2
+    wx0, wy0 = pixel_to_world(H, cx_check,     cy_check)
+    wx1, wy1 = pixel_to_world(H, cx_check + 1, cy_check)
+    m_per_px  = np.hypot(wx1 - wx0, wy1 - wy0) * scale_m_per_w
+    print(f"  [Geometry] Scale check: 1 px at field centre ≈ {m_per_px:.4f} m  "
+          f"(expected ~{distance_m / max(abs(finish_seg[0][0]-start_seg[0][0]), 1):.4f} m/px along sprint axis)")
 
     print("Opening capture...")
     cap     = open_capture(source)
@@ -607,8 +642,12 @@ def main():
     start_events  = defaultdict(list)
     finish_events = defaultdict(list)
 
-    rng = np.random.default_rng(42)
-    def rand_color(_): return tuple(int(v) for v in rng.integers(60, 230, 3))
+    def rand_color(tid):
+        # Stable, visually distinct color per track ID using golden-ratio HSV spacing
+        hue = (tid * 0.618033988749895) % 1.0
+        hsv = np.uint8([[[int(hue * 179), 220, 210]]])
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+        return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
 
     frame_idx       = 0
     fps_display     = 0.0
@@ -674,6 +713,9 @@ def main():
 
             for box, tid, conf in zip(boxes, ids, confs):
                 x1, y1, x2, y2 = box
+                # Skip boxes that are too small (noise / partial detections)
+                if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
+                    continue
                 cx_px = (x1 + x2) * 0.5
                 cy_px = float(y2)
 
@@ -681,6 +723,9 @@ def main():
                     continue
 
                 current_ids.add(tid)
+                # Re-entered RoI after a brief occlusion — clear the exit timestamp
+                if tid in tracks and tracks[tid].roi_exit_t is not None:
+                    tracks[tid].roi_exit_t = None
                 wx, wy   = pixel_to_world(H, cx_px, cy_px)
                 wx_m     = wx * scale_m_per_w
                 wy_m     = wy * scale_m_per_w
@@ -689,6 +734,7 @@ def main():
                     tracks[tid] = TrackState(
                         kf=make_kalman(vid_fps, wx_m, wy_m), t=t_now,
                         px=int(cx_px), py=int(cy_px),
+                        wx_m=wx_m, wy_m=wy_m,
                         color=rand_color(tid), box=(x1,y1,x2,y2)
                     )
 
@@ -699,16 +745,24 @@ def main():
                 kf.predict()
                 kf.update([wx_m, wy_m])
 
-                speed_ms = np.hypot(float(kf.x[2].item()), float(kf.x[3].item()))
+                # Speed via position-diff / elapsed-time — avoids Kalman velocity
+                # unit confusion (kf.x[2/3] are world-units/step, not m/s).
+                dt_frame = t_now - state.prev_t
+                if dt_frame > 1e-6:
+                    prev_wx_m, prev_wy_m = state.prev_wm
+                    speed_ms = np.hypot(wx_m - prev_wx_m, wy_m - prev_wy_m) / dt_frame
+                else:
+                    speed_ms = state.last_speed_ms  # same-timestamp guard
                 state.speed_buf.append(speed_ms)
                 disp_ms = float(np.median(state.speed_buf))
                 disp_kh = disp_ms * 3.6
 
                 if state.prev_t > 0:
-                    state.total_dist += disp_ms * (t_now - state.prev_t)
+                    state.total_dist += disp_ms * dt_frame
 
                 state.last_speed_ms = speed_ms
                 state.prev_t        = t_now
+                state.prev_wm       = (wx_m, wy_m)
                 state.last_seen_t   = t_now
                 state.last_box      = (x1, y1, x2, y2)
                 state.last_disp_kh  = disp_kh
@@ -731,7 +785,8 @@ def main():
                 if frame_idx % LOG_EVERY_N == 0:
                     speed_logs[tid].append((t_now, disp_ms, state.total_dist))
 
-        for tid, state in list(tracks.items()):
+        for tid in list(tracks.keys()):
+            state = tracks[tid]
             if t_now - state.last_seen_t > 2.0:
                 del tracks[tid]
                 continue
@@ -740,6 +795,10 @@ def main():
             disp_kh = state.last_disp_kh
 
             if tid not in current_ids:
+                # Record RoI exit on the first frame this track is no longer detected
+                if state.roi_exit_t is None:
+                    state.roi_exit_t = t_now
+                # --- Kalman-predict position for coasting tracks ---
                 dt = t_now - state.prev_t
                 if dt > 0:
                     state.kf.predict()
@@ -751,37 +810,62 @@ def main():
                 pred_wy_m = float(state.kf.x[1].item())
                 new_cx, new_cy = world_to_pixel(H_inv, pred_wx_m / scale_m_per_w, pred_wy_m / scale_m_per_w)
                 old_x1, old_y1, old_x2, old_y2 = state.last_box
-                old_cx, old_cy = (old_x1 + old_x2) * 0.5, float(old_y2)
-                dx, dy = new_cx - old_cx, new_cy - old_cy
-                x1 = old_x1 + dx; y1 = old_y1 + dy
-                x2 = old_x2 + dx; y2 = old_y2 + dy
-                state.last_box = (x1, y1, x2, y2)
-                col = tuple(max(0, c - 60) for c in col)
-                cv2.rectangle(annotated, (int(x1),int(y1)), (int(x2),int(y2)), col, 2, cv2.LINE_4)
+                bw = old_x2 - old_x1
+                bh = old_y2 - old_y1
+                # Guard: skip drawing if box has no area (uninitialized / degenerate)
+                if bw < 4 or bh < 4:
+                    continue
+                old_cx = old_x1 + bw * 0.5
+                old_cy = float(old_y2)
+                dx, dy  = new_cx - old_cx, new_cy - old_cy
+                bx1 = old_x1 + dx; by1 = old_y1 + dy
+                bx2 = old_x2 + dx; by2 = old_y2 + dy
+                state.last_box = (bx1, by1, bx2, by2)
+                draw_col = tuple(max(0, c - 60) for c in col)
+                cv2.rectangle(annotated, (int(bx1), int(by1)), (int(bx2), int(by2)), draw_col, 2, cv2.LINE_4)
                 if frame_idx % LOG_EVERY_N == 0:
                     disp_ms = float(np.median(state.speed_buf)) if state.speed_buf else 0.0
                     speed_logs[tid].append((t_now, disp_ms, state.total_dist))
             else:
-                x1, y1, x2, y2 = state.last_box
-                cv2.rectangle(annotated, (int(x1),int(y1)), (int(x2),int(y2)), col, 2)
+                bx1, by1, bx2, by2 = state.last_box
+                bw = bx2 - bx1; bh = by2 - by1
+                if bw < 4 or bh < 4:
+                    continue
+                draw_col = col
+                cv2.rectangle(annotated, (int(bx1), int(by1)), (int(bx2), int(by2)), draw_col, 2)
 
+            # --- Label (uses local bx1,by1 — no scope leak from detection loop) ---
             label = f"ID {tid}  {disp_kh:.1f}km/h  {state.total_dist:.1f}m"
-            (tw,th),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-            lx = max(int(x1), 0)
-            ly = max(int(y1)-8, th+4)
-            cv2.rectangle(annotated, (lx,ly-th-4), (lx+tw+6,ly+2), col, -1)
-            cv2.putText(annotated, label, (lx+3,ly-2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255,255,255), 2, cv2.LINE_AA)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+            lx  = max(int(bx1), 0)
+            lx  = min(lx, annotated.shape[1] - tw - 8)
+            ly  = max(int(by1) - 8, th + 4)
+            cv2.rectangle(annotated, (lx, ly - th - 4), (lx + tw + 6, ly + 2), draw_col, -1)
+            cv2.putText(annotated, label, (lx + 3, ly - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
 
             if state.start_crossed and not state.finish_crossed:
                 elapsed = t_now - state.start_crossed[-1]
                 cv2.putText(annotated, f"SPRINT {elapsed:.1f}s",
-                            (int(x1), int(y1)-30), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65, (0,255,255), 2, cv2.LINE_AA)
+                            (int(bx1), max(int(by1) - 30, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
             elif state.finish_crossed:
                 cv2.putText(annotated, "FINISH",
-                            (int(x1), int(y1)-30), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65, (0,80,255), 2, cv2.LINE_AA)
+                            (int(bx1), max(int(by1) - 30, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 80, 255), 2, cv2.LINE_AA)
+
+            # Per-subject RoI timer shown below the label
+            if state.roi_exit_t is None:
+                roi_elapsed = t_now - state.roi_entry_t
+                timer_txt   = f"In RoI: {roi_elapsed:.2f}s"
+                timer_col   = (0, 255, 180)
+            else:
+                roi_elapsed = state.roi_exit_t - state.roi_entry_t
+                timer_txt   = f"RoI: {roi_elapsed:.2f}s (done)"
+                timer_col   = (180, 180, 180)
+            cv2.putText(annotated, timer_txt,
+                        (int(bx1), min(int(by2) + 18, annotated.shape[0] - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, timer_col, 1, cv2.LINE_AA)
 
         t_wall      = time.perf_counter()
         fps_display = 0.9*fps_display + 0.1/max(t_wall-t_fps, 1e-9)
@@ -790,6 +874,33 @@ def main():
         cv2.putText(annotated,
                     f"FPS:{fps_display:.1f}  Frame:{frame_idx}  [{device.upper()}]  {hint}",
                     (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0,255,0), 2, cv2.LINE_AA)
+
+        # Timer when subject enter and exits.
+        all_states = list(tracks.values())
+        entered    = [s for s in all_states if s.roi_entry_t is not None]
+        active     = [s for s in entered    if s.roi_exit_t  is None]
+        if entered:
+            global_start = min(s.roi_entry_t for s in entered)
+            if active:
+                # At least one subject still inside
+                global_elapsed = t_now - global_start
+                clock_col      = (0, 255, 100)
+                clock_label    = f"Stopwatch: {global_elapsed:.2f}s"
+            else:
+                # Everyone has left — freeze at the last exit time
+                global_elapsed = max(s.roi_exit_t for s in entered) - global_start
+                clock_col      = (100, 200, 255)
+                clock_label    = f"Stopwatch: {global_elapsed:.2f}s  [FINAL]"
+            # Draw a semi-transparent background pill for the clock
+            (cw, ch), _ = cv2.getTextSize(clock_label, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+            cx0 = annotated.shape[1] // 2 - cw // 2
+            cy0 = annotated.shape[0] - 44
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (cx0 - 10, cy0 - ch - 6), (cx0 + cw + 10, cy0 + 6),
+                          (20, 20, 20), -1)
+            cv2.addWeighted(overlay, 0.55, annotated, 0.45, 0, annotated)
+            cv2.putText(annotated, clock_label, (cx0, cy0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, clock_col, 2, cv2.LINE_AA)
 
         if flask_streamer: flask_streamer.push(annotated)
         cv2.imshow("Speed Tracker", annotated)
