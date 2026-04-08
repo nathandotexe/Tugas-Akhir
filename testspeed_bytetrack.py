@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from filterpy.kalman import KalmanFilter
 from ultralytics import YOLO
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+
 from flask import Flask, Response
 
 MODEL_PATH        = "Yolov11/best.pt"
