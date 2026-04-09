@@ -17,12 +17,12 @@ GRAPH_OUTPUT_DIST = "speed_graph_dist.png"
 VIDEO_OUTPUT      = "output_tracked.mp4"
 DISPLAY_SIZE      = (1280, 720)
 CLASSES_TO_TRACK  = [0]
-MEDIAN_WIN        = 7
+MEDIAN_WIN        = 11  # wider window = more spike rejection
 LOG_EVERY_N       = 1
 SKIP_FRAMES       = 1
 CONF_THRESHOLD    = 0.35
 IOU_THRESHOLD     = 0.45
-MIN_BOX_AREA      = 100   # px² discard tiny/spurious detections
+MIN_BOX_AREA      = 100   # px² — discard tiny/spurious detections
 
 CALIB_PATH        = "calib.npz"
 RTSP_URL          = "rtsp://localhost:8554/live"
@@ -432,9 +432,12 @@ def make_kalman(fps, wx, wy):
     kf.F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]], dtype=float)
     kf.H = np.eye(2, 4, dtype=float)
     kf.x = np.array([[wx],[wy],[0.0],[0.0]])
-    kf.P = np.diag([5.0, 5.0, 2.0, 2.0])
-    kf.R = np.diag([0.3, 0.3])
-    kf.Q = np.diag([0.05, 0.05, 0.5, 0.5])
+    kf.P = np.diag([2.0, 2.0, 1.0, 1.0])
+    # R: measurement noise in metres. A bounding box foot-point can jitter
+    # ~5-10px; at ~0.05 m/px that's ~0.25-0.5 m. Use 0.5² = 0.25 per axis.
+    kf.R = np.diag([0.25, 0.25])
+    # Q: process noise — runners accelerate at most ~2-3 m/s² so keep this small
+    kf.Q = np.diag([0.01, 0.01, 0.1, 0.1])
     return kf
 
 
@@ -485,74 +488,117 @@ class TrackState:
         self.roi_exit_t     = None # time this subject left the RoI (None = still inside)
 
 
-def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time, out_path_dist):
+# Minimum thresholds to include a track in the graph
+MIN_GRAPH_FRAMES    = 5     # must have at least this many logged frames
+MIN_GRAPH_SPEED_KMH = 0.5   # must have avg speed above this (filters truly stationary ghosts)
+MIN_GRAPH_DIST_M    = 0.3   # must have travelled at least this far in the RoI
+
+
+def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time, out_path_dist, vid_fps=30.0):
     if not speed_logs:
         print("No speed data."); return
     from scipy.ndimage import gaussian_filter1d
-    n = len(speed_logs)
-    # Use tab20 so we have 20 distinct colours — enough for large groups
+
+    # Filter out ghost/noise tracks before plotting
+    valid_logs = {}
+    for tid, records in speed_logs.items():
+        if len(records) < MIN_GRAPH_FRAMES:
+            continue
+        speeds_kmh = [r[1] * 3.6 for r in records]
+        dist = records[-1][2] if len(records[-1]) > 2 else 0.0
+        if float(np.mean(speeds_kmh)) < MIN_GRAPH_SPEED_KMH:
+            continue
+        if dist < MIN_GRAPH_DIST_M:
+            continue
+        valid_logs[tid] = records
+
+    if not valid_logs:
+        print("No valid speed data after filtering."); return
+    print(f"  [Graph] Plotting {len(valid_logs)} tracks "
+          f"(filtered {len(speed_logs) - len(valid_logs)} ghost/noise tracks)")
+
+    # tab20 gives 20 visually distinct colours; enough for large groups
     palette = plt.cm.tab20.colors
 
     for out_path, x_key, xlabel, title_suffix in [
         (out_path_time, "time", "Time (s)",     "Over Time"),
         (out_path_dist, "dist", "Distance (m)", "Over Distance"),
     ]:
-        row_h   = 3.5          # height per subplot row
-        fig_h   = row_h * n + 1.2   # +1.2 for suptitle headroom
-        fig, axes = plt.subplots(n, 1, figsize=(13, fig_h), squeeze=False)
-        fig.suptitle(f"Athlete Speed Profiles ({title_suffix})",
-                     fontsize=16, fontweight="bold")
+        fig, ax = plt.subplots(figsize=(14, 7))
+        ax.set_title(f"Athlete Speed Profiles — {title_suffix}",
+                     fontsize=14, fontweight="bold", pad=12)
 
-        for row_axes, (tid, records) in zip(axes, sorted(speed_logs.items())):
-            ax = row_axes[0]
+        all_xs = []
+
+        for tid, records in sorted(valid_logs.items()):
             if len(records) < 3:
-                ax.set_title(f"ID {tid} — insufficient data")
-                ax.set_visible(True)
                 continue
 
             ts   = np.array([r[0] for r in records])
             kmph = np.array([r[1] for r in records]) * 3.6
             ds   = np.array([r[2] if len(r) > 2 else 0.0 for r in records])
-            xs   = ts if x_key == "time" else ds
+
+            # Normalise time to RoI entry so subjects are comparable from t=0
+            ts_norm = ts - ts[0]
+            xs   = ts_norm if x_key == "time" else ds
             col  = palette[tid % len(palette)]
 
-            # Sort by x-axis so the line never jumps backwards
-            order = np.argsort(xs)
-            xs_s, kmph_s = xs[order], kmph[order]
+            order  = np.argsort(xs)
+            xs_s   = xs[order]
+            kmph_s = kmph[order]
+            all_xs.extend(xs_s.tolist())
 
-            ax.plot(xs_s, kmph_s, color=col, alpha=0.2, linewidth=1)
-            smooth = gaussian_filter1d(kmph_s, sigma=4)
-            ax.plot(xs_s, smooth, color=col, linewidth=2.3, label=f"ID {tid}")
+            # Faint raw trace + bold smoothed line
+            ax.plot(xs_s, kmph_s, color=col, alpha=0.15, linewidth=1)
+            smooth = gaussian_filter1d(kmph_s, sigma=3)
+            peak   = float(np.max(kmph_s))
+            avg    = float(np.mean(kmph_s))
+            ax.plot(xs_s, smooth, color=col, linewidth=2.2,
+                    label=f"ID {tid}  |  peak {peak:.1f} km/h  avg {avg:.1f} km/h")
 
-            seen_start = seen_finish = False
-            for st in start_events.get(tid, []):
-                idx = np.searchsorted(ts, st)
-                xv  = st if x_key == "time" else (ds[min(idx, len(ds)-1)] if len(ds) else st)
-                ax.axvline(xv, color="lime", linestyle=":", linewidth=1.5,
-                           label="Start" if not seen_start else "_")
-                seen_start = True
-            for ft in finish_events.get(tid, []):
-                idx = np.searchsorted(ts, ft)
-                xv  = ft if x_key == "time" else (ds[min(idx, len(ds)-1)] if len(ds) else ft)
-                ax.axvline(xv, color="red", linestyle="--", linewidth=1.5,
-                           label="Finish" if not seen_finish else "_")
-                seen_finish = True
+            # End-of-track marker so line endings are explicit, not ambiguous
+            ax.plot(xs_s[-1], smooth[-1], marker='x', color=col,
+                    markersize=8, markeredgewidth=2.5, zorder=5)
 
+            # Peak annotation — flip side if peak is in the right half to avoid crowding
             if len(smooth) > 0:
-                pk = int(np.argmax(smooth))
-                ax.annotate(f"Peak {smooth[pk]:.1f} km/h",
+                pk      = int(np.argmax(smooth))
+                x_span  = float(xs_s[-1] - xs_s[0]) if len(xs_s) > 1 else 1.0
+                offset_x = max(x_span * 0.04, 0.5)
+                offset_y = 1.5
+                if xs_s[pk] > xs_s[0] + x_span * 0.55:
+                    offset_x = -abs(offset_x) - 1.0
+                ann_ha = "right" if offset_x < 0 else "left"
+                ann_txt = "ID %d\n%.1f km/h" % (tid, smooth[pk])
+                ax.annotate(ann_txt,
                             xy=(xs_s[pk], smooth[pk]),
-                            xytext=(xs_s[pk] + max((xs_s[-1]-xs_s[0])*0.02, 0.3),
-                                    smooth[pk] + 1.5),
-                            fontsize=8, color="darkred",
-                            arrowprops=dict(arrowstyle="->", color="darkred", lw=1.2))
+                            xytext=(xs_s[pk] + offset_x, smooth[pk] + offset_y),
+                            fontsize=7, color=col, fontweight="bold", ha=ann_ha,
+                            arrowprops=dict(arrowstyle="->", color=col, lw=0.9))
 
-            ax.set_ylabel("Speed (km/h)")
-            ax.set_xlabel(xlabel)
-            ax.set_title(f"ID {tid}  Peak:{max(kmph):.1f}  Avg:{np.mean(kmph):.1f} km/h")
-            ax.set_ylim(bottom=0)
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8, loc="upper right")
+            # Start / finish crossing markers per subject
+            t0 = float(ts[0])
+            for st in start_events.get(tid, []):
+                idx = int(np.searchsorted(ts, st))
+                xv  = (st - t0) if x_key == "time" else ds[min(idx, len(ds) - 1)]
+                ax.axvline(xv, color=col, linestyle=":", linewidth=1.2, alpha=0.7)
+            for ft in finish_events.get(tid, []):
+                idx = int(np.searchsorted(ts, ft))
+                xv  = (ft - t0) if x_key == "time" else ds[min(idx, len(ds) - 1)]
+                ax.axvline(xv, color=col, linestyle="--", linewidth=1.2, alpha=0.7)
+
+        # Shared x-axis covers all subjects so nothing looks missing
+        if all_xs:
+            margin = max((max(all_xs) - min(all_xs)) * 0.03, 0.5)
+            ax.set_xlim(left=min(all_xs) - margin, right=max(all_xs) + margin)
+
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel("Speed (km/h)", fontsize=11)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=9, loc="upper right", framealpha=0.88,
+                  title="Subject  (dotted=start  dashed=finish  x=last seen)",
+                  title_fontsize=8)
 
         plt.tight_layout()
         plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -637,7 +683,9 @@ def main():
 
     writer = AsyncWriter(VIDEO_OUTPUT, vid_fps, DISPLAY_SIZE) if VIDEO_OUTPUT else None
 
-    tracks        = {}
+    tracks          = {}
+    finished_tracks = {}   # tracks removed from active set but kept for graphing
+    id_remap        = {}   # bytetrack tid → canonical tid (for re-identified tracks)
     speed_logs    = defaultdict(list)
     start_events  = defaultdict(list)
     finish_events = defaultdict(list)
@@ -722,37 +770,94 @@ def main():
                 if not point_in_polygon(int(cx_px), int(cy_px), corners):
                     continue
 
-                current_ids.add(tid)
+                ctid = id_remap.get(tid, tid)
+                current_ids.add(ctid)
                 # Re-entered RoI after a brief occlusion — clear the exit timestamp
-                if tid in tracks and tracks[tid].roi_exit_t is not None:
-                    tracks[tid].roi_exit_t = None
+                if ctid in tracks and tracks[ctid].roi_exit_t is not None:
+                    tracks[ctid].roi_exit_t = None
                 wx, wy   = pixel_to_world(H, cx_px, cy_px)
                 wx_m     = wx * scale_m_per_w
                 wy_m     = wy * scale_m_per_w
 
                 if tid not in tracks:
-                    tracks[tid] = TrackState(
-                        kf=make_kalman(vid_fps, wx_m, wy_m), t=t_now,
-                        px=int(cx_px), py=int(cy_px),
-                        wx_m=wx_m, wy_m=wy_m,
-                        color=rand_color(tid), box=(x1,y1,x2,y2)
-                    )
+                    # ── Re-identification ──────────────────────────────────────────
+                    # If a finished track's Kalman prediction lands close to this new
+                    # detection, it's almost certainly the same person re-acquired
+                    # under a new ByteTrack ID. Steal the old canonical ID so that
+                    # speed_logs stay continuous and the on-screen label doesn't jump.
+                    REID_DIST_M = 3.0   # max world-metre distance to count as same person
+                    best_old_tid  = None
+                    best_old_dist = REID_DIST_M
+                    for old_tid, old_state in list(finished_tracks.items()):
+                        pred_wx = float(old_state.kf.x[0].item())
+                        pred_wy = float(old_state.kf.x[1].item())
+                        d = np.hypot(wx_m - pred_wx, wy_m - pred_wy)
+                        if d < best_old_dist:
+                            best_old_dist = d
+                            best_old_tid  = old_tid
 
-                state   = tracks[tid]
-                kf      = state.kf
-                q_scale = 1.0 + (1.0 - float(conf)) * 2.0
-                kf.Q    = np.diag([0.05, 0.05, 0.5*q_scale, 0.5*q_scale])
+                    if best_old_tid is not None:
+                        # Remap: treat this new ByteTrack tid as the old canonical ID
+                        canonical_tid = best_old_tid
+                        id_remap[tid] = canonical_tid
+                        old_state = finished_tracks.pop(best_old_tid)
+                        # Reinitialise Kalman at current position but keep history
+                        old_state.kf.x[0] = wx_m
+                        old_state.kf.x[1] = wy_m
+                        old_state.prev_t      = t_now
+                        old_state.prev_wm     = (wx_m, wy_m)
+                        old_state.last_seen_t = t_now
+                        old_state.roi_exit_t  = None
+                        tracks[canonical_tid] = old_state
+                        # Point the new ByteTrack tid at the canonical slot
+                        if canonical_tid != tid:
+                            tracks[tid] = tracks[canonical_tid]
+                        # Merge any speed_log data already recorded under the new tid
+                        # into the canonical tid so the graph stays continuous
+                        if tid in speed_logs and tid != canonical_tid:
+                            speed_logs[canonical_tid].extend(speed_logs.pop(tid))
+                            speed_logs[canonical_tid].sort(key=lambda r: r[0])
+                        if tid in start_events and tid != canonical_tid:
+                            start_events[canonical_tid].extend(start_events.pop(tid))
+                        if tid in finish_events and tid != canonical_tid:
+                            finish_events[canonical_tid].extend(finish_events.pop(tid))
+                        print(f"  [ReID] ByteTrack ID {tid} → canonical ID {canonical_tid} "
+                              f"(dist {best_old_dist:.2f}m)")
+                    else:
+                        canonical_tid = tid
+                        tracks[tid] = TrackState(
+                            kf=make_kalman(vid_fps, wx_m, wy_m), t=t_now,
+                            px=int(cx_px), py=int(cy_px),
+                            wx_m=wx_m, wy_m=wy_m,
+                            color=rand_color(canonical_tid), box=(x1,y1,x2,y2)
+                        )
+                else:
+                    canonical_tid = id_remap.get(tid, tid)
+
+                # Use canonical_tid for all state/log access from here on
+                ctid  = id_remap.get(tid, tid)
+                state = tracks.get(ctid) or tracks[tid]
+                kf    = state.kf
+                # Scale process noise with detection confidence: low conf → noisier
+                q_scale = 1.0 + (1.0 - float(conf)) * 3.0
+                kf.Q    = np.diag([0.01, 0.01, 0.1*q_scale, 0.1*q_scale])
                 kf.predict()
                 kf.update([wx_m, wy_m])
 
-                # Speed via position-diff / elapsed-time — avoids Kalman velocity
-                # unit confusion (kf.x[2/3] are world-units/step, not m/s).
+                # Speed from Kalman-smoothed positions (not raw detections).
+                # kf.x[0,1] are the filtered world-metre coords after update —
+                # diffing these across frames is far less noisy than raw bbox jitter.
                 dt_frame = t_now - state.prev_t
+                smoothed_wx = float(kf.x[0].item())
+                smoothed_wy = float(kf.x[1].item())
                 if dt_frame > 1e-6:
                     prev_wx_m, prev_wy_m = state.prev_wm
-                    speed_ms = np.hypot(wx_m - prev_wx_m, wy_m - prev_wy_m) / dt_frame
+                    speed_ms = np.hypot(smoothed_wx - prev_wx_m,
+                                        smoothed_wy - prev_wy_m) / dt_frame
+                    # Hard cap: no human runs faster than 12 m/s (~43 km/h, Usain Bolt)
+                    speed_ms = min(speed_ms, 12.0)
                 else:
-                    speed_ms = state.last_speed_ms  # same-timestamp guard
+                    speed_ms = state.last_speed_ms
                 state.speed_buf.append(speed_ms)
                 disp_ms = float(np.median(state.speed_buf))
                 disp_kh = disp_ms * 3.6
@@ -762,7 +867,7 @@ def main():
 
                 state.last_speed_ms = speed_ms
                 state.prev_t        = t_now
-                state.prev_wm       = (wx_m, wy_m)
+                state.prev_wm       = (smoothed_wx, smoothed_wy)  # store smoothed, not raw
                 state.last_seen_t   = t_now
                 state.last_box      = (x1, y1, x2, y2)
                 state.last_disp_kh  = disp_kh
@@ -772,22 +877,27 @@ def main():
 
                 if segments_cross((ppx,ppy),(new_px,new_py), start_seg[0], start_seg[1]):
                     state.start_crossed.append(t_now)
-                    start_events[tid].append(t_now)
-                    print(f"  START  ID {tid}  t={t_now:.2f}s  {disp_kh:.1f} km/h")
+                    start_events[ctid].append(t_now)
+                    print(f"  START  ID {ctid}  t={t_now:.2f}s  {disp_kh:.1f} km/h")
 
                 if segments_cross((ppx,ppy),(new_px,new_py), finish_seg[0], finish_seg[1]):
                     state.finish_crossed.append(t_now)
-                    finish_events[tid].append(t_now)
-                    print(f"  FINISH ID {tid}  t={t_now:.2f}s  {disp_kh:.1f} km/h")
+                    finish_events[ctid].append(t_now)
+                    print(f"  FINISH ID {ctid}  t={t_now:.2f}s  {disp_kh:.1f} km/h")
 
                 state.prev_px = (new_px, new_py)
 
                 if frame_idx % LOG_EVERY_N == 0:
-                    speed_logs[tid].append((t_now, disp_ms, state.total_dist))
+                    speed_logs[ctid].append((t_now, disp_ms, state.total_dist))
 
         for tid in list(tracks.keys()):
             state = tracks[tid]
             if t_now - state.last_seen_t > 2.0:
+                # Archive instead of delete — keeps the track visible in summary/graph
+                # but stops spending CPU on it. Mark exit if not already marked.
+                if state.roi_exit_t is None:
+                    state.roi_exit_t = state.last_seen_t
+                finished_tracks[tid] = state
                 del tracks[tid]
                 continue
 
@@ -823,9 +933,8 @@ def main():
                 state.last_box = (bx1, by1, bx2, by2)
                 draw_col = tuple(max(0, c - 60) for c in col)
                 cv2.rectangle(annotated, (int(bx1), int(by1)), (int(bx2), int(by2)), draw_col, 2, cv2.LINE_4)
-                if frame_idx % LOG_EVERY_N == 0:
-                    disp_ms = float(np.median(state.speed_buf)) if state.speed_buf else 0.0
-                    speed_logs[tid].append((t_now, disp_ms, state.total_dist))
+                # Do NOT log coasting frames — only real detections go into speed_logs
+                # so the graph ends cleanly where the runner was last actually seen.
             else:
                 bx1, by1, bx2, by2 = state.last_box
                 bw = bx2 - bx1; bh = by2 - by1
@@ -875,22 +984,23 @@ def main():
                     f"FPS:{fps_display:.1f}  Frame:{frame_idx}  [{device.upper()}]  {hint}",
                     (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0,255,0), 2, cv2.LINE_AA)
 
-        # Timer when subject enter and exits.
-        all_states = list(tracks.values())
+        # --- Global RoI clock ---
+        # Starts when the first subject enters, freezes when all have exited.
+        all_states = list(tracks.values()) + list(finished_tracks.values())
         entered    = [s for s in all_states if s.roi_entry_t is not None]
-        active     = [s for s in entered    if s.roi_exit_t  is None]
+        active     = [s for s in tracks.values() if s.roi_exit_t is None]
         if entered:
             global_start = min(s.roi_entry_t for s in entered)
             if active:
-                # At least one subject still inside
+                # At least one subject still inside — clock runs
                 global_elapsed = t_now - global_start
                 clock_col      = (0, 255, 100)
-                clock_label    = f"Stopwatch: {global_elapsed:.2f}s"
+                clock_label    = f"RoI Clock: {global_elapsed:.2f}s"
             else:
                 # Everyone has left — freeze at the last exit time
                 global_elapsed = max(s.roi_exit_t for s in entered) - global_start
                 clock_col      = (100, 200, 255)
-                clock_label    = f"Stopwatch: {global_elapsed:.2f}s  [FINAL]"
+                clock_label    = f"RoI Clock: {global_elapsed:.2f}s  [all out]"
             # Draw a semi-transparent background pill for the clock
             (cw, ch), _ = cv2.getTextSize(clock_label, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
             cx0 = annotated.shape[1] // 2 - cw // 2
@@ -933,7 +1043,7 @@ def main():
               f"Dist:{dist:.1f}m  Finishes:{len(finish_events[tid])}  Splits:[{t_str}]")
 
     generate_speed_graphs(speed_logs, start_events, finish_events,
-                          GRAPH_OUTPUT_TIME, GRAPH_OUTPUT_DIST)
+                          GRAPH_OUTPUT_TIME, GRAPH_OUTPUT_DIST, vid_fps)
     if VIDEO_OUTPUT and os.path.exists(VIDEO_OUTPUT):
         print(f"  Video -> {VIDEO_OUTPUT}")
 
