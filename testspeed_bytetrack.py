@@ -10,19 +10,24 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from flask import Flask, Response
 
-MODEL_PATH        = "Yolov11/best.pt"
+DISPLAY_SIZE      = (1280, 720)
+SKIP_FRAMES       = 1
+
+CONF_THRESHOLD    = 0.30
+IOU_THRESHOLD     = 0.30
+MIN_BOX_AREA      = 160
+TRACK_IMGSZ       = 960
+FLASK_ENABLED     = False
+VIDEO_OUTPUT      = None
+
+MODEL_PATH        = "yolov11/best.pt"
 H_PATH            = "H.npy"
 GRAPH_OUTPUT_TIME = "speed_graph_time.png"
 GRAPH_OUTPUT_DIST = "speed_graph_dist.png"
 VIDEO_OUTPUT      = "output_tracked.mp4"
-DISPLAY_SIZE      = (1280, 720)
 CLASSES_TO_TRACK  = [0]
-MEDIAN_WIN        = 11  # wider window = more spike rejection
+MEDIAN_WIN        = 31  # wider window = more spike rejection
 LOG_EVERY_N       = 1
-SKIP_FRAMES       = 1
-CONF_THRESHOLD    = 0.35
-IOU_THRESHOLD     = 0.45
-MIN_BOX_AREA      = 100   # px² — discard tiny/spurious detections
 
 CALIB_PATH        = "calib.npz"
 RTSP_URL          = "rtsp://localhost:8554/live"
@@ -489,12 +494,12 @@ class TrackState:
 
 
 # Minimum thresholds to include a track in the graph
-MIN_GRAPH_FRAMES    = 5     # must have at least this many logged frames
-MIN_GRAPH_SPEED_KMH = 0.5   # must have avg speed above this (filters truly stationary ghosts)
-MIN_GRAPH_DIST_M    = 0.3   # must have travelled at least this far in the RoI
+MIN_GRAPH_FRAMES    = 10    # raised from 5 — a split fragment only exists for a few frames
+MIN_GRAPH_SPEED_KMH = 1.0   # raised from 0.5 — filters truly stationary ghosts
+MIN_GRAPH_DIST_M    = 0.5   # raised from 0.3 — must have physically moved
 
 
-def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time, out_path_dist, vid_fps=30.0):
+def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time, out_path_dist, vid_fps=30.0, runner_names=None):
     if not speed_logs:
         print("No speed data."); return
     from scipy.ndimage import gaussian_filter1d
@@ -548,13 +553,20 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
             kmph_s = kmph[order]
             all_xs.extend(xs_s.tolist())
 
-            # Faint raw trace + bold smoothed line
-            ax.plot(xs_s, kmph_s, color=col, alpha=0.15, linewidth=1)
-            smooth = gaussian_filter1d(kmph_s, sigma=3)
+            # Faint raw trace (commented out to prevent visual confusion with ghosts)
+            # ax.plot(xs_s, kmph_s, color=col, alpha=0.15, linewidth=1)
+            # Use dynamic smoothing based on frame rate (a 3-sigma window roughly spans ~18 frames at 60fps)
+            sigma_val = max(3, int(vid_fps / 6))
+            smooth = gaussian_filter1d(kmph_s, sigma=sigma_val)
             peak   = float(np.max(kmph_s))
             avg    = float(np.mean(kmph_s))
+            
+            name_label = f"ID {tid}"
+            if runner_names and tid in runner_names and runner_names[tid]:
+                name_label = f"{runner_names[tid]} (ID {tid})"
+
             ax.plot(xs_s, smooth, color=col, linewidth=2.2,
-                    label=f"ID {tid}  |  peak {peak:.1f} km/h  avg {avg:.1f} km/h")
+                    label=f"{name_label}  |  peak {peak:.1f} km/h  avg {avg:.1f} km/h")
 
             # End-of-track marker so line endings are explicit, not ambiguous
             ax.plot(xs_s[-1], smooth[-1], marker='x', color=col,
@@ -569,7 +581,7 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
                 if xs_s[pk] > xs_s[0] + x_span * 0.55:
                     offset_x = -abs(offset_x) - 1.0
                 ann_ha = "right" if offset_x < 0 else "left"
-                ann_txt = "ID %d\n%.1f km/h" % (tid, smooth[pk])
+                ann_txt = "%s\n%.1f km/h" % (name_label, smooth[pk])
                 ax.annotate(ann_txt,
                             xy=(xs_s[pk], smooth[pk]),
                             xytext=(xs_s[pk] + offset_x, smooth[pk] + offset_y),
@@ -685,13 +697,12 @@ def main():
 
     tracks          = {}
     finished_tracks = {}   # tracks removed from active set but kept for graphing
-    id_remap        = {}   # bytetrack tid → canonical tid (for re-identified tracks)
+    id_remap        = {}   # bytetrack tid to canonical tid (for re-identified tracks)
     speed_logs    = defaultdict(list)
     start_events  = defaultdict(list)
     finish_events = defaultdict(list)
 
     def rand_color(tid):
-        # Stable, visually distinct color per track ID using golden-ratio HSV spacing
         hue = (tid * 0.618033988749895) % 1.0
         hsv = np.uint8([[[int(hue * 179), 220, 210]]])
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
@@ -728,27 +739,46 @@ def main():
 
         ret, frame = cap.read()
         if not ret:
-            print("End of stream."); break
+            print("End of stream.")
+            break
 
         frame = undistort_frame(frame, calib_map1, calib_map2)
         frame = cv2.resize(frame, DISPLAY_SIZE)
         frame_idx += 1
         t_now = (frame_idx / vid_fps) if mode == "offline" else time.perf_counter()
 
-        masked_frame = cv2.bitwise_and(frame, frame, mask=roi_mask)
-
+        # =========================
+        # TRACK DI FRAME PENUH
+        # =========================
         if (frame_idx % SKIP_FRAMES == 0) or frame_idx == 1:
             results = model.track(
-                masked_frame, persist=True, tracker="bytetrack.yaml",
-                classes=CLASSES_TO_TRACK, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
-                half=use_half, device=device, verbose=False, imgsz=640,
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                classes=CLASSES_TO_TRACK,
+                conf=CONF_THRESHOLD,
+                iou=IOU_THRESHOLD,
+                half=use_half,
+                device=device,
+                verbose=False,
+                imgsz=TRACK_IMGSZ,
             )
             last_det_result = results[0]
 
         if last_det_result is None:
             cv2.imshow("Speed Tracker", frame)
-            if cv2.waitKey(1) == 27: break
+            if cv2.waitKey(1) == 27:
+                break
             continue
+
+        # Prune finished_tracks that are too old to be re-IDed.
+        # Keeps them long enough for legitimate re-ID (same person leaves and
+        # re-enters the RoI) but expires true stale ghosts so they can't
+        # incorrectly absorb a new detection that walks near the old exit point.
+        FINISHED_TTL = 6.0   # seconds
+        for _tid in [k for k, s in finished_tracks.items()
+                     if t_now - s.last_seen_t > FINISHED_TTL]:
+            del finished_tracks[_tid]
 
         annotated   = frame.copy()
         current_ids = set()
@@ -759,105 +789,132 @@ def main():
             ids   = det.boxes.id.cpu().numpy().astype(int)
             confs = det.boxes.conf.cpu().numpy()
 
+            # Pre-calculate active canonical IDs in this frame's detections 
+            # so we don't attempt to re-ID against a track that is actually detected.
+            current_frame_ctids = {id_remap.get(t, t) for t in ids}
+
             for box, tid, conf in zip(boxes, ids, confs):
                 x1, y1, x2, y2 = box
-                # Skip boxes that are too small (noise / partial detections)
-                if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
+
+                # skip noise box
+                area = (x2 - x1) * (y2 - y1)
+                if area < MIN_BOX_AREA:
                     continue
+
+                # pakai titik kaki sebagai acuan posisi atlet
                 cx_px = (x1 + x2) * 0.5
                 cy_px = float(y2)
 
+                # FILTER ROI SETELAH DETEKSI
                 if not point_in_polygon(int(cx_px), int(cy_px), corners):
                     continue
 
                 ctid = id_remap.get(tid, tid)
                 current_ids.add(ctid)
-                # Re-entered RoI after a brief occlusion — clear the exit timestamp
+
                 if ctid in tracks and tracks[ctid].roi_exit_t is not None:
                     tracks[ctid].roi_exit_t = None
-                wx, wy   = pixel_to_world(H, cx_px, cy_px)
-                wx_m     = wx * scale_m_per_w
-                wy_m     = wy * scale_m_per_w
 
-                if tid not in tracks:
-                    # ── Re-identification ──────────────────────────────────────────
-                    # If a finished track's Kalman prediction lands close to this new
-                    # detection, it's almost certainly the same person re-acquired
-                    # under a new ByteTrack ID. Steal the old canonical ID so that
-                    # speed_logs stay continuous and the on-screen label doesn't jump.
-                    REID_DIST_M = 3.0   # max world-metre distance to count as same person
+                wx, wy = pixel_to_world(H, cx_px, cy_px)
+                wx_m   = wx * scale_m_per_w
+                wy_m   = wy * scale_m_per_w
+
+                if tid not in tracks and ctid not in tracks:
+                    # Re-ID search radius: large enough to recover a runner who was
+                    # dropped for several lag-frames and kept moving.
+                    # At ~7 m/s and up to 1 s of lag the runner can travel ~7 m,
+                    # so 5 m gives comfortable headroom without merging two people
+                    # who are side-by-side (typical separation on a sprint lane > 1 m).
+                    REID_DIST_M = 5.0
                     best_old_tid  = None
                     best_old_dist = REID_DIST_M
+                    best_is_finished = False
+
+                    candidates = []
                     for old_tid, old_state in list(finished_tracks.items()):
-                        pred_wx = float(old_state.kf.x[0].item())
-                        pred_wy = float(old_state.kf.x[1].item())
+                        candidates.append((old_tid, old_state, True))
+                    # Also check currently "lost" tracks that haven't expired to finished_tracks yet
+                    for old_tid, old_state in list(tracks.items()):
+                        if old_tid not in current_frame_ctids:
+                            candidates.append((old_tid, old_state, False))
+
+                    for old_tid, old_state, is_finished in candidates:
+                        # Project where this track would be NOW using its
+                        # last known velocity from the Kalman state, so the search
+                        # window moves with the runner rather than being anchored
+                        # to the last-seen position.
+                        dt_since = t_now - old_state.last_seen_t
+                        pred_wx = float(old_state.kf.x[0].item()) + float(old_state.kf.x[2].item()) * dt_since
+                        pred_wy = float(old_state.kf.x[1].item()) + float(old_state.kf.x[3].item()) * dt_since
                         d = np.hypot(wx_m - pred_wx, wy_m - pred_wy)
                         if d < best_old_dist:
                             best_old_dist = d
                             best_old_tid  = old_tid
+                            best_is_finished = is_finished
 
                     if best_old_tid is not None:
-                        # Remap: treat this new ByteTrack tid as the old canonical ID
                         canonical_tid = best_old_tid
                         id_remap[tid] = canonical_tid
-                        old_state = finished_tracks.pop(best_old_tid)
-                        # Reinitialise Kalman at current position but keep history
+
+                        if best_is_finished:
+                            old_state = finished_tracks.pop(best_old_tid)
+                        else:
+                            old_state = tracks[best_old_tid]
+                            
                         old_state.kf.x[0] = wx_m
                         old_state.kf.x[1] = wy_m
-                        old_state.prev_t      = t_now
-                        old_state.prev_wm     = (wx_m, wy_m)
+                        old_state.prev_t = t_now
+                        old_state.prev_wm = (wx_m, wy_m)
                         old_state.last_seen_t = t_now
-                        old_state.roi_exit_t  = None
+                        old_state.roi_exit_t = None
+                        old_state.last_box = (x1, y1, x2, y2)
+
                         tracks[canonical_tid] = old_state
-                        # Point the new ByteTrack tid at the canonical slot
-                        if canonical_tid != tid:
-                            tracks[tid] = tracks[canonical_tid]
-                        # Merge any speed_log data already recorded under the new tid
-                        # into the canonical tid so the graph stays continuous
+
                         if tid in speed_logs and tid != canonical_tid:
                             speed_logs[canonical_tid].extend(speed_logs.pop(tid))
                             speed_logs[canonical_tid].sort(key=lambda r: r[0])
+
                         if tid in start_events and tid != canonical_tid:
                             start_events[canonical_tid].extend(start_events.pop(tid))
+
                         if tid in finish_events and tid != canonical_tid:
                             finish_events[canonical_tid].extend(finish_events.pop(tid))
-                        print(f"  [ReID] ByteTrack ID {tid} → canonical ID {canonical_tid} "
-                              f"(dist {best_old_dist:.2f}m)")
                     else:
-                        canonical_tid = tid
-                        tracks[tid] = TrackState(
-                            kf=make_kalman(vid_fps, wx_m, wy_m), t=t_now,
-                            px=int(cx_px), py=int(cy_px),
-                            wx_m=wx_m, wy_m=wy_m,
-                            color=rand_color(canonical_tid), box=(x1,y1,x2,y2)
+                        canonical_tid = ctid
+                        tracks[canonical_tid] = TrackState(
+                            kf=make_kalman(vid_fps, wx_m, wy_m),
+                            t=t_now,
+                            px=int(cx_px),
+                            py=int(cy_px),
+                            wx_m=wx_m,
+                            wy_m=wy_m,
+                            color=rand_color(canonical_tid),
+                            box=(x1, y1, x2, y2)
                         )
                 else:
-                    canonical_tid = id_remap.get(tid, tid)
+                    canonical_tid = ctid
 
-                # Use canonical_tid for all state/log access from here on
-                ctid  = id_remap.get(tid, tid)
-                state = tracks.get(ctid) or tracks[tid]
-                kf    = state.kf
-                # Scale process noise with detection confidence: low conf → noisier
-                q_scale = 1.0 + (1.0 - float(conf)) * 3.0
-                kf.Q    = np.diag([0.01, 0.01, 0.1*q_scale, 0.1*q_scale])
+                state = tracks[canonical_tid]
+                kf = state.kf
+
+                q_scale = 1.0 + (1.0 - float(conf)) * 2.0
+                kf.Q = np.diag([0.01, 0.01, 0.08 * q_scale, 0.08 * q_scale])
+
                 kf.predict()
                 kf.update([wx_m, wy_m])
 
-                # Speed from Kalman-smoothed positions (not raw detections).
-                # kf.x[0,1] are the filtered world-metre coords after update —
-                # diffing these across frames is far less noisy than raw bbox jitter.
                 dt_frame = t_now - state.prev_t
                 smoothed_wx = float(kf.x[0].item())
                 smoothed_wy = float(kf.x[1].item())
+
                 if dt_frame > 1e-6:
                     prev_wx_m, prev_wy_m = state.prev_wm
-                    speed_ms = np.hypot(smoothed_wx - prev_wx_m,
-                                        smoothed_wy - prev_wy_m) / dt_frame
-                    # Hard cap: no human runs faster than 12 m/s (~43 km/h, Usain Bolt)
-                    speed_ms = min(speed_ms, 12.0)
+                    speed_ms = np.hypot(smoothed_wx - prev_wx_m, smoothed_wy - prev_wy_m) / dt_frame
+                    speed_ms = min(speed_ms, 8.5) # cap at ~30.6 km/h for untrained runners
                 else:
                     speed_ms = state.last_speed_ms
+
                 state.speed_buf.append(speed_ms)
                 disp_ms = float(np.median(state.speed_buf))
                 disp_kh = disp_ms * 3.6
@@ -866,35 +923,30 @@ def main():
                     state.total_dist += disp_ms * dt_frame
 
                 state.last_speed_ms = speed_ms
-                state.prev_t        = t_now
-                state.prev_wm       = (smoothed_wx, smoothed_wy)  # store smoothed, not raw
-                state.last_seen_t   = t_now
-                state.last_box      = (x1, y1, x2, y2)
-                state.last_disp_kh  = disp_kh
+                state.prev_t = t_now
+                state.prev_wm = (smoothed_wx, smoothed_wy)
+                state.last_seen_t = t_now
+                state.last_box = (x1, y1, x2, y2)
+                state.last_disp_kh = disp_kh
 
                 new_px, new_py = int(cx_px), int(cy_px)
                 ppx, ppy = state.prev_px
 
-                if segments_cross((ppx,ppy),(new_px,new_py), start_seg[0], start_seg[1]):
+                if segments_cross((ppx, ppy), (new_px, new_py), start_seg[0], start_seg[1]):
                     state.start_crossed.append(t_now)
-                    start_events[ctid].append(t_now)
-                    print(f"  START  ID {ctid}  t={t_now:.2f}s  {disp_kh:.1f} km/h")
+                    start_events[canonical_tid].append(t_now)
 
-                if segments_cross((ppx,ppy),(new_px,new_py), finish_seg[0], finish_seg[1]):
+                if segments_cross((ppx, ppy), (new_px, new_py), finish_seg[0], finish_seg[1]):
                     state.finish_crossed.append(t_now)
-                    finish_events[ctid].append(t_now)
-                    print(f"  FINISH ID {ctid}  t={t_now:.2f}s  {disp_kh:.1f} km/h")
+                    finish_events[canonical_tid].append(t_now)
 
                 state.prev_px = (new_px, new_py)
 
                 if frame_idx % LOG_EVERY_N == 0:
-                    speed_logs[ctid].append((t_now, disp_ms, state.total_dist))
-
+                    speed_logs[canonical_tid].append((t_now, disp_ms, state.total_dist))
         for tid in list(tracks.keys()):
             state = tracks[tid]
-            if t_now - state.last_seen_t > 2.0:
-                # Archive instead of delete — keeps the track visible in summary/graph
-                # but stops spending CPU on it. Mark exit if not already marked.
+            if t_now - state.last_seen_t > 3.0:  
                 if state.roi_exit_t is None:
                     state.roi_exit_t = state.last_seen_t
                 finished_tracks[tid] = state
@@ -904,11 +956,12 @@ def main():
             col     = state.color
             disp_kh = state.last_disp_kh
 
+            draw_col = col
             if tid not in current_ids:
                 # Record RoI exit on the first frame this track is no longer detected
                 if state.roi_exit_t is None:
                     state.roi_exit_t = t_now
-                # --- Kalman-predict position for coasting tracks ---
+         
                 dt = t_now - state.prev_t
                 if dt > 0:
                     state.kf.predict()
@@ -932,9 +985,10 @@ def main():
                 bx2 = old_x2 + dx; by2 = old_y2 + dy
                 state.last_box = (bx1, by1, bx2, by2)
                 draw_col = tuple(max(0, c - 60) for c in col)
-                cv2.rectangle(annotated, (int(bx1), int(by1)), (int(bx2), int(by2)), draw_col, 2, cv2.LINE_4)
-                # Do NOT log coasting frames — only real detections go into speed_logs
-                # so the graph ends cleanly where the runner was last actually seen.
+                
+                if t_now - state.last_seen_t < 1.0:
+                    cv2.rectangle(annotated, (int(bx1), int(by1)), (int(bx2), int(by2)), draw_col, 2, cv2.LINE_4)
+             
             else:
                 bx1, by1, bx2, by2 = state.last_box
                 bw = bx2 - bx1; bh = by2 - by1
@@ -943,38 +997,39 @@ def main():
                 draw_col = col
                 cv2.rectangle(annotated, (int(bx1), int(by1)), (int(bx2), int(by2)), draw_col, 2)
 
-            # --- Label (uses local bx1,by1 — no scope leak from detection loop) ---
-            label = f"ID {tid}  {disp_kh:.1f}km/h  {state.total_dist:.1f}m"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-            lx  = max(int(bx1), 0)
-            lx  = min(lx, annotated.shape[1] - tw - 8)
-            ly  = max(int(by1) - 8, th + 4)
-            cv2.rectangle(annotated, (lx, ly - th - 4), (lx + tw + 6, ly + 2), draw_col, -1)
-            cv2.putText(annotated, label, (lx + 3, ly - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+            if tid in current_ids or (t_now - state.last_seen_t < 1.0):
+                # Label (uses local bx1,by1)
+                label = f"ID {tid}  {disp_kh:.1f}km/h  {state.total_dist:.1f}m"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+                lx  = max(int(bx1), 0)
+                lx  = min(lx, annotated.shape[1] - tw - 8)
+                ly  = max(int(by1) - 8, th + 4)
+                cv2.rectangle(annotated, (lx, ly - th - 4), (lx + tw + 6, ly + 2), draw_col, -1)
+                cv2.putText(annotated, label, (lx + 3, ly - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
 
-            if state.start_crossed and not state.finish_crossed:
-                elapsed = t_now - state.start_crossed[-1]
-                cv2.putText(annotated, f"SPRINT {elapsed:.1f}s",
-                            (int(bx1), max(int(by1) - 30, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
-            elif state.finish_crossed:
-                cv2.putText(annotated, "FINISH",
-                            (int(bx1), max(int(by1) - 30, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 80, 255), 2, cv2.LINE_AA)
+                if state.start_crossed and not state.finish_crossed:
+                    elapsed = t_now - state.start_crossed[-1]
+                    cv2.putText(annotated, f"SPRINT {elapsed:.1f}s",
+                                (int(bx1), max(int(by1) - 30, 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+                elif state.finish_crossed:
+                    cv2.putText(annotated, "FINISH",
+                                (int(bx1), max(int(by1) - 30, 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 80, 255), 2, cv2.LINE_AA)
 
-            # Per-subject RoI timer shown below the label
-            if state.roi_exit_t is None:
-                roi_elapsed = t_now - state.roi_entry_t
-                timer_txt   = f"In RoI: {roi_elapsed:.2f}s"
-                timer_col   = (0, 255, 180)
-            else:
-                roi_elapsed = state.roi_exit_t - state.roi_entry_t
-                timer_txt   = f"RoI: {roi_elapsed:.2f}s (done)"
-                timer_col   = (180, 180, 180)
-            cv2.putText(annotated, timer_txt,
-                        (int(bx1), min(int(by2) + 18, annotated.shape[0] - 4)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, timer_col, 1, cv2.LINE_AA)
+                # Per-subject RoI timer shown below the label
+                if state.roi_exit_t is None:
+                    roi_elapsed = t_now - state.roi_entry_t
+                    timer_txt   = f"In RoI: {roi_elapsed:.2f}s"
+                    timer_col   = (0, 255, 180)
+                else:
+                    roi_elapsed = state.roi_exit_t - state.roi_entry_t
+                    timer_txt   = f"RoI: {roi_elapsed:.2f}s (done)"
+                    timer_col   = (180, 180, 180)
+                cv2.putText(annotated, timer_txt,
+                            (int(bx1), min(int(by2) + 18, annotated.shape[0] - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, timer_col, 1, cv2.LINE_AA)
 
         t_wall      = time.perf_counter()
         fps_display = 0.9*fps_display + 0.1/max(t_wall-t_fps, 1e-9)
@@ -1042,8 +1097,62 @@ def main():
               f"Avg:{np.mean(spds)*3.6:6.2f}km/h  "
               f"Dist:{dist:.1f}m  Finishes:{len(finish_events[tid])}  Splits:[{t_str}]")
 
+    # Find valid IDs to prompt for names
+    valid_tids = []
+    for tid, records in speed_logs.items():
+        if len(records) >= MIN_GRAPH_FRAMES:
+            speeds_kmh = [r[1] * 3.6 for r in records]
+            dist = records[-1][2] if len(records[-1]) > 2 else 0.0
+            if float(np.mean(speeds_kmh)) >= MIN_GRAPH_SPEED_KMH and dist >= MIN_GRAPH_DIST_M:
+                valid_tids.append(tid)
+
+    runner_names = {}
+    if valid_tids:
+        root3 = tk.Tk()
+        root3.title("Enter Runner Names")
+        root3.geometry("400x400")
+        root3.resizable(True, True)
+        tk.Label(root3, text="Enter runner names:", 
+                 wraplength=380, font=("Arial", 11)).pack(pady=10)
+        
+        canvas = tk.Canvas(root3)
+        scrollbar = ttk.Scrollbar(root3, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        entries = {}
+        for tid_val in sorted(valid_tids):
+            row_frame = tk.Frame(scrollable_frame)
+            row_frame.pack(fill="x", padx=10, pady=5)
+            tk.Label(row_frame, text=f"ID {tid_val}:", width=8, anchor="e").pack(side="left")
+            entry = tk.Entry(row_frame, width=30)
+            entry.pack(side="left", padx=5)
+            entries[tid_val] = entry
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        def save_names():
+            for t, ent in entries.items():
+                val = ent.get().strip()
+                if val:
+                    runner_names[t] = val
+            root3.destroy()
+
+        btn_frame = tk.Frame(root3)
+        btn_frame.pack(fill="x", pady=10)
+        tk.Button(btn_frame, text="Generate Graphs", command=save_names, width=20, bg="#4CAF50", fg="white", font=("Arial", 10, "bold")).pack()
+        
+        root3.mainloop()
+
     generate_speed_graphs(speed_logs, start_events, finish_events,
-                          GRAPH_OUTPUT_TIME, GRAPH_OUTPUT_DIST, vid_fps)
+                          GRAPH_OUTPUT_TIME, GRAPH_OUTPUT_DIST, vid_fps, runner_names=runner_names)
     if VIDEO_OUTPUT and os.path.exists(VIDEO_OUTPUT):
         print(f"  Video -> {VIDEO_OUTPUT}")
 
