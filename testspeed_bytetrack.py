@@ -1,4 +1,4 @@
-import os, cv2, time, threading, queue, subprocess, signal, socket
+import os, cv2, time, threading, queue
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -22,97 +22,25 @@ VIDEO_OUTPUT      = None
 
 MODEL_PATH        = "yolov11/best.pt"
 H_PATH            = "H.npy"
+CALIB_PATH        = "calib.npz"
 GRAPH_OUTPUT_TIME = "speed_graph_time.png"
 GRAPH_OUTPUT_DIST = "speed_graph_dist.png"
 VIDEO_OUTPUT      = "output_tracked.mp4"
 CLASSES_TO_TRACK  = [0]
-MEDIAN_WIN        = 31  # wider window = more spike rejection
+MEDIAN_WIN        = 45  # wider window = more spike rejection
 LOG_EVERY_N       = 1
 
-CALIB_PATH        = "calib.npz"
 RTMP_URL          = "rtmp://192.168.1.17:1935/live"
 FLASK_PORT        = 5000
 FLASK_ENABLED     = True
 
-MEDIAMTX_EXE     = "mediamtx.exe"
-MEDIAMTX_YML     = "mediamtx.yml"
-RTMP_PORT         = 1935
+SHOW_SPEED_OVERLAY = True   # show km/h column in the top-right info panel
+SHOW_ROI_OVERLAY   = True   # show RoI timer column in the top-right info panel
 
 CORNER_LABELS = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
 EDGE_NAMES    = ["Top (TL->TR)", "Right (TR->BR)", "Bottom (BR->BL)", "Left (BL->TL)"]
 EDGES         = [(0,1),(1,2),(2,3),(3,0)]
 COLORS        = [(0,255,255),(0,200,255),(0,150,255),(0,100,255)]
-
-class MediaMTXManager:
-    def __init__(self):
-        self._proc = None
-
-    def _kill_port(self, port):
-        """Kill any process currently occupying a TCP port."""
-        try:
-            out = subprocess.check_output(
-                f'netstat -ano | findstr :{port}', shell=True, text=True
-            )
-            pids = set()
-            for line in out.splitlines():
-                parts = line.split()
-                if parts and parts[-1].isdigit():
-                    pids.add(parts[-1])
-            for pid in pids:
-                subprocess.call(f'taskkill /PID {pid} /F', shell=True,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if pids:
-                print(f"  [MediaMTX] Cleared {len(pids)} process(es) from port {port}")
-                time.sleep(0.5)
-        except Exception:
-            pass
-
-    def _port_ready(self, port, timeout=10.0):
-        """Wait until a TCP port is accepting connections."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                    return True
-            except OSError:
-                time.sleep(0.3)
-        return False
-
-    def start(self):
-        if not os.path.exists(MEDIAMTX_EXE):
-            print(f"  [MediaMTX] EXE not found: {MEDIAMTX_EXE}")
-            print("  [MediaMTX] Set MEDIAMTX_EXE at the top of the script to the correct path.")
-            return False
-
-        print("  [MediaMTX] Clearing port 1935...")
-        self._kill_port(RTMP_PORT)
-
-        print("  [MediaMTX] Starting...")
-        self._proc = subprocess.Popen(
-            [MEDIAMTX_EXE, MEDIAMTX_YML],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-
-        if self._port_ready(RTMP_PORT):
-            print(f"  [MediaMTX] Ready — RTMP :1935  RTMP :1935")
-            return True
-        else:
-            print("  [MediaMTX] Timed out waiting for port 1935. Check MEDIAMTX_EXE path.")
-            self.stop()
-            return False
-
-    def stop(self):
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            print("  [MediaMTX] Stopped.")
-        self._proc = None
-
 
 def load_calibration(calib_path):
     if calib_path is None or not os.path.exists(calib_path):
@@ -142,7 +70,6 @@ def undistort_frame(frame, map1, map2):
     if map1 is None or map2 is None:
         return frame
     return cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-
 
 
 class FlaskStreamer:
@@ -313,7 +240,7 @@ def gui_pick_start_finish():
     result = {"val": None}
     root = tk.Tk()
     root.title("Choose Start / Finish Edges & Distance")
-    root.geometry("400x260")
+    root.geometry("400x280")
     root.resizable(False, False)
 
     tk.Label(root, text="Choose Start & Finish Lines",
@@ -332,8 +259,10 @@ def gui_pick_start_finish():
                  state="readonly", width=22).grid(row=1, column=1)
 
     tk.Label(frm, text="Distance (meters):").grid(row=2, column=0, padx=8, pady=6, sticky="e")
-    dist_var = tk.StringVar(value="10.0")
+    dist_var = tk.StringVar(value="")
     tk.Entry(frm, textvariable=dist_var, width=24).grid(row=2, column=1)
+    tk.Label(frm, text="(leave blank for pixel-only mode)",
+             font=("Arial", 8), fg="gray").grid(row=3, column=1, sticky="w")
 
     def confirm():
         si = EDGE_NAMES.index(start_var.get())
@@ -341,12 +270,16 @@ def gui_pick_start_finish():
         if si == fi:
             messagebox.showwarning("Invalid", "Start and Finish must be different.")
             return
-        try:
-            dist_val = float(dist_var.get())
-            if dist_val <= 0: raise ValueError
-        except ValueError:
-            messagebox.showwarning("Invalid", "Distance must be a positive number.")
-            return
+        raw = dist_var.get().strip()
+        if raw == "":
+            dist_val = None  # pure pixel mode
+        else:
+            try:
+                dist_val = float(raw)
+                if dist_val <= 0: raise ValueError
+            except ValueError:
+                messagebox.showwarning("Invalid", "Distance must be a positive number (or blank for pixel mode).")
+                return
         result["val"] = (si, fi, dist_val)
         root.destroy()
 
@@ -396,9 +329,17 @@ def run_field_setup(frame, H):
 
 
 def load_homography(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Homography file '{path}' not found.")
+    if not path or not os.path.exists(path):
+        print(f"  [Homography] Not found: '{path}' — running in pixel-scale mode.")
+        return None
     return np.load(path)
+
+
+def build_pixel_homography(scale_px_to_m):
+    H = np.eye(3, dtype=np.float64)
+    H[0, 0] = scale_px_to_m
+    H[1, 1] = scale_px_to_m
+    return H
 
 
 def pixel_to_world(H, px, py):
@@ -436,7 +377,7 @@ def make_kalman(fps, wx, wy):
     kf.H = np.eye(2, 4, dtype=float)
     kf.x = np.array([[wx],[wy],[0.0],[0.0]])
     kf.P = np.diag([2.0, 2.0, 1.0, 1.0])
-    # R: measurement noise in metres. A bounding box foot-point can jitter
+
     # ~5-10px; at ~0.05 m/px that's ~0.25-0.5 m. Use 0.5² = 0.25 per axis.
     kf.R = np.diag([0.25, 0.25])
     # Q: process noise — runners accelerate at most ~2-3 m/s² so keep this small
@@ -497,21 +438,27 @@ MIN_GRAPH_SPEED_KMH = 1.0   # raised from 0.5 — filters truly stationary ghost
 MIN_GRAPH_DIST_M    = 0.5   # raised from 0.3 — must have physically moved
 
 
-def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time, out_path_dist, vid_fps=30.0, runner_names=None):
+def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time, out_path_dist, vid_fps=30.0, runner_names=None, pure_pixel_mode=False):
     if not speed_logs:
         print("No speed data."); return
     from scipy.ndimage import gaussian_filter1d
 
     # Filter out ghost/noise tracks before plotting
+    # In pure pixel mode speeds are px/s (no conversion), otherwise km/h
+    filt_speed_mult = 1.0 if pure_pixel_mode else 3.6
+    # Thresholds: 1 km/h ≈ 0.28 m/s ≈ ~5 px/s at typical drone altitude
+    min_speed_filt = 5.0 if pure_pixel_mode else MIN_GRAPH_SPEED_KMH
+    min_dist_filt  = 10.0 if pure_pixel_mode else MIN_GRAPH_DIST_M
+
     valid_logs = {}
     for tid, records in speed_logs.items():
         if len(records) < MIN_GRAPH_FRAMES:
             continue
-        speeds_kmh = [r[1] * 3.6 for r in records]
+        speeds_conv = [r[1] * filt_speed_mult for r in records]
         dist = records[-1][2] if len(records[-1]) > 2 else 0.0
-        if float(np.mean(speeds_kmh)) < MIN_GRAPH_SPEED_KMH:
+        if float(np.mean(speeds_conv)) < min_speed_filt:
             continue
-        if dist < MIN_GRAPH_DIST_M:
+        if dist < min_dist_filt:
             continue
         valid_logs[tid] = records
 
@@ -523,9 +470,13 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
     # tab20 gives 20 visually distinct colours; enough for large groups
     palette = plt.cm.tab20.colors
 
+    speed_unit = "px/s" if pure_pixel_mode else "km/h"
+    dist_unit  = "px"   if pure_pixel_mode else "m"
+    speed_mult = 1.0    if pure_pixel_mode else 3.6   # m/s→km/h or px/s→px/s
+
     for out_path, x_key, xlabel, title_suffix in [
-        (out_path_time, "time", "Time (s)",     "Over Time"),
-        (out_path_dist, "dist", "Distance (m)", "Over Distance"),
+        (out_path_time, "time", "Time (s)",                       "Over Time"),
+        (out_path_dist, "dist", f"Distance ({dist_unit})", "Over Distance"),
     ]:
         fig, ax = plt.subplots(figsize=(14, 7))
         ax.set_title(f"Athlete Speed Profiles — {title_suffix}",
@@ -538,7 +489,7 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
                 continue
 
             ts   = np.array([r[0] for r in records])
-            kmph = np.array([r[1] for r in records]) * 3.6
+            kmph = np.array([r[1] for r in records]) * speed_mult
             ds   = np.array([r[2] if len(r) > 2 else 0.0 for r in records])
 
             # Normalise time to RoI entry so subjects are comparable from t=0
@@ -564,7 +515,7 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
                 name_label = f"{runner_names[tid]} (ID {tid})"
 
             ax.plot(xs_s, smooth, color=col, linewidth=2.2,
-                    label=f"{name_label}  |  peak {peak:.1f} km/h  avg {avg:.1f} km/h")
+                    label=f"{name_label}  |  peak {peak:.1f} {speed_unit}  avg {avg:.1f} {speed_unit}")
 
             # End-of-track marker so line endings are explicit, not ambiguous
             ax.plot(xs_s[-1], smooth[-1], marker='x', color=col,
@@ -579,7 +530,7 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
                 if xs_s[pk] > xs_s[0] + x_span * 0.55:
                     offset_x = -abs(offset_x) - 1.0
                 ann_ha = "right" if offset_x < 0 else "left"
-                ann_txt = "%s\n%.1f km/h" % (name_label, smooth[pk])
+                ann_txt = "%s\n%.1f %s" % (name_label, smooth[pk], speed_unit)
                 ax.annotate(ann_txt,
                             xy=(xs_s[pk], smooth[pk]),
                             xytext=(xs_s[pk] + offset_x, smooth[pk] + offset_y),
@@ -603,7 +554,7 @@ def generate_speed_graphs(speed_logs, start_events, finish_events, out_path_time
             ax.set_xlim(left=min(all_xs) - margin, right=max(all_xs) + margin)
 
         ax.set_xlabel(xlabel, fontsize=11)
-        ax.set_ylabel("Speed (km/h)", fontsize=11)
+        ax.set_ylabel(f"Speed ({speed_unit})", fontsize=11)
         ax.set_ylim(bottom=0)
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=9, loc="upper right", framealpha=0.88,
@@ -622,12 +573,6 @@ def main():
         print("Cancelled."); return
     print(f"\nMode: {mode}  |  Source: {source}")
 
-    mediamtx = None
-    if mode == "realtime":
-        mediamtx = MediaMTXManager()
-        if not mediamtx.start():
-            print("  [MediaMTX] Failed to start — continuing anyway (manual start may work).")
-
     device = "cpu"
     try:
         import torch
@@ -645,7 +590,10 @@ def main():
     print(f"Loading {MODEL_PATH}...")
     model = YOLO(MODEL_PATH)
     H = load_homography(H_PATH)
-    H_inv = np.linalg.inv(H)
+    # H_inv and pixel-mode flag are resolved after field setup when we know
+    # the corner pixel coordinates (needed to compute pixel scale).
+    H_inv      = None
+    pixel_mode = (H is None)
 
     if mode == "realtime":
         print("\n  Waiting for DJI stream...")
@@ -660,28 +608,56 @@ def main():
     setup = run_field_setup(first_frame, H)
     if setup is None:
         print("Field setup cancelled.")
-        if mediamtx: mediamtx.stop()
         return
     corners, start_seg, finish_seg, roi_mask, distance_m = setup
+
+    # pure_pixel_mode: no homography AND no distance → speeds in px/s
+    pure_pixel_mode = (pixel_mode and distance_m is None)
 
     scx = (start_seg[0][0] + start_seg[1][0]) / 2.0
     scy = (start_seg[0][1] + start_seg[1][1]) / 2.0
     fcx = (finish_seg[0][0] + finish_seg[1][0]) / 2.0
     fcy = (finish_seg[0][1] + finish_seg[1][1]) / 2.0
-    ws_x, ws_y = pixel_to_world(H, scx, scy)
-    wf_x, wf_y = pixel_to_world(H, fcx, fcy)
-    world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
-    scale_m_per_w = distance_m / world_dist if world_dist > 0 and distance_m > 0 else 1.0
-    print(f"  [Geometry] {distance_m}m = {world_dist:.2f} world units  (scale {scale_m_per_w:.4f} m/wu)")
-    # Sanity-check: print what 1 pixel of movement at the field centre implies in metres.
-    # If this looks wildly off (e.g. >0.5 m/px or <0.01 m/px) your H or scale is suspect.
-    cx_check = (corners[0][0] + corners[2][0]) / 2.0 if 'corners' in dir() else DISPLAY_SIZE[0] / 2
-    cy_check = (corners[0][1] + corners[2][1]) / 2.0 if 'corners' in dir() else DISPLAY_SIZE[1] / 2
-    wx0, wy0 = pixel_to_world(H, cx_check,     cy_check)
-    wx1, wy1 = pixel_to_world(H, cx_check + 1, cy_check)
-    m_per_px  = np.hypot(wx1 - wx0, wy1 - wy0) * scale_m_per_w
-    print(f"  [Geometry] Scale check: 1 px at field centre ≈ {m_per_px:.4f} m  "
-          f"(expected ~{distance_m / max(abs(finish_seg[0][0]-start_seg[0][0]), 1):.4f} m/px along sprint axis)")
+
+    if pure_pixel_mode:
+        # No homography, no distance — identity H so world units = pixels
+        H     = build_pixel_homography(1.0)   # 1 px = 1 wu
+        H_inv = np.linalg.inv(H)
+        scale_m_per_w = 1.0                   # "metres" are really pixels
+        print("  [Geometry] Pure pixel mode: speeds will be in px/s")
+    elif pixel_mode:
+        # No homography file but distance provided — derive px→m scale
+        px_dist = np.hypot(fcx - scx, fcy - scy)
+        if px_dist < 1:
+            px_dist = 1.0
+        px_to_m = distance_m / px_dist          # metres per pixel
+        H       = build_pixel_homography(px_to_m)
+        H_inv   = np.linalg.inv(H)
+        ws_x, ws_y = pixel_to_world(H, scx, scy)
+        wf_x, wf_y = pixel_to_world(H, fcx, fcy)
+        world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
+        scale_m_per_w = distance_m / world_dist if world_dist > 0 else 1.0
+        print(f"  [Geometry] Pixel mode: {distance_m}m over {px_dist:.1f} px "
+              f"→ scale {px_to_m:.4f} m/px")
+    else:
+        H_inv = np.linalg.inv(H)
+        ws_x, ws_y = pixel_to_world(H, scx, scy)
+        wf_x, wf_y = pixel_to_world(H, fcx, fcy)
+        world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
+        scale_m_per_w = distance_m / world_dist if world_dist > 0 and distance_m and distance_m > 0 else 1.0
+
+    if not pure_pixel_mode:
+        ws_x, ws_y = pixel_to_world(H, scx, scy)
+        wf_x, wf_y = pixel_to_world(H, fcx, fcy)
+        world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
+        eff_dist = distance_m if distance_m else world_dist
+        print(f"  [Geometry] {eff_dist}m = {world_dist:.2f} world units  (scale {scale_m_per_w:.4f} m/wu)")
+        cx_check = (corners[0][0] + corners[2][0]) / 2.0
+        cy_check = (corners[0][1] + corners[2][1]) / 2.0
+        wx0, wy0 = pixel_to_world(H, cx_check,     cy_check)
+        wx1, wy1 = pixel_to_world(H, cx_check + 1, cy_check)
+        m_per_px  = np.hypot(wx1 - wx0, wy1 - wy0) * scale_m_per_w
+        print(f"  [Geometry] Scale check: 1 px at field centre ≈ {m_per_px:.4f} m")
 
     print("Opening capture...")
     cap     = open_capture(source)
@@ -733,15 +709,33 @@ def main():
                 new_setup = run_field_setup(live, H)
                 if new_setup is not None:
                     corners, start_seg, finish_seg, roi_mask, distance_m = new_setup
+                    pure_pixel_mode = (pixel_mode and distance_m is None)
                     scx = (start_seg[0][0] + start_seg[1][0]) / 2.0
                     scy = (start_seg[0][1] + start_seg[1][1]) / 2.0
                     fcx = (finish_seg[0][0] + finish_seg[1][0]) / 2.0
                     fcy = (finish_seg[0][1] + finish_seg[1][1]) / 2.0
-                    ws_x, ws_y = pixel_to_world(H, scx, scy)
-                    wf_x, wf_y = pixel_to_world(H, fcx, fcy)
-                    world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
-                    scale_m_per_w = distance_m / world_dist if world_dist > 0 else 1.0
-                    print(f"  [Geometry] Recalibrated: {distance_m}m = {world_dist:.2f} wu (scale {scale_m_per_w:.4f})")
+                    if pure_pixel_mode:
+                        H     = build_pixel_homography(1.0)
+                        H_inv = np.linalg.inv(H)
+                        scale_m_per_w = 1.0
+                        print("  [Geometry] Recalibrated: pure pixel mode (px/s)")
+                    elif pixel_mode:
+                        px_dist = np.hypot(fcx - scx, fcy - scy)
+                        if px_dist < 1: px_dist = 1.0
+                        px_to_m = distance_m / px_dist
+                        H       = build_pixel_homography(px_to_m)
+                        H_inv   = np.linalg.inv(H)
+                        ws_x, ws_y = pixel_to_world(H, scx, scy)
+                        wf_x, wf_y = pixel_to_world(H, fcx, fcy)
+                        world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
+                        scale_m_per_w = distance_m / world_dist if world_dist > 0 else 1.0
+                        print(f"  [Geometry] Recalibrated: {distance_m}m = {world_dist:.2f} wu (scale {scale_m_per_w:.4f})")
+                    else:
+                        ws_x, ws_y = pixel_to_world(H, scx, scy)
+                        wf_x, wf_y = pixel_to_world(H, fcx, fcy)
+                        world_dist = np.hypot(wf_x - ws_x, wf_y - ws_y)
+                        scale_m_per_w = distance_m / world_dist if world_dist > 0 else 1.0
+                        print(f"  [Geometry] Recalibrated: {distance_m}m = {world_dist:.2f} wu (scale {scale_m_per_w:.4f})")
                     tracks.clear()
             paused = False
 
@@ -755,9 +749,6 @@ def main():
         frame_idx += 1
         t_now = (frame_idx / vid_fps) if mode == "offline" else time.perf_counter()
 
-        # =========================
-        # TRACK DI FRAME PENUH
-        # =========================
         if (frame_idx % SKIP_FRAMES == 0) or frame_idx == 1:
             results = model.track(
                 frame,
@@ -779,10 +770,6 @@ def main():
                 break
             continue
 
-        # Prune finished_tracks that are too old to be re-IDed.
-        # Keeps them long enough for legitimate re-ID (same person leaves and
-        # re-enters the RoI) but expires true stale ghosts so they can't
-        # incorrectly absorb a new detection that walks near the old exit point.
         FINISHED_TTL = 6.0   # seconds
         for _tid in [k for k, s in finished_tracks.items()
                      if t_now - s.last_seen_t > FINISHED_TTL]:
@@ -809,11 +796,11 @@ def main():
                 if area < MIN_BOX_AREA:
                     continue
 
-                # pakai titik kaki sebagai acuan posisi atlet
+                # use foot as position reference
                 cx_px = (x1 + x2) * 0.5
                 cy_px = float(y2)
 
-                # FILTER ROI SETELAH DETEKSI
+                # FILTER ROI AFTER DETECTION
                 if not point_in_polygon(int(cx_px), int(cy_px), corners):
                     continue
 
@@ -821,19 +808,20 @@ def main():
                 current_ids.add(ctid)
 
                 if ctid in tracks and tracks[ctid].roi_exit_t is not None:
-                    tracks[ctid].roi_exit_t = None
+                    # Runner reappeared — cancel the exit and shift the
+                    # entry time forward so the gap is not counted.
+                    gap_duration = t_now - tracks[ctid].roi_exit_t
+                    tracks[ctid].roi_entry_t += gap_duration
+                    tracks[ctid].roi_exit_t   = None
 
                 wx, wy = pixel_to_world(H, cx_px, cy_px)
                 wx_m   = wx * scale_m_per_w
                 wy_m   = wy * scale_m_per_w
 
                 if tid not in tracks and ctid not in tracks:
-                    # Re-ID search radius: large enough to recover a runner who was
-                    # dropped for several lag-frames and kept moving.
-                    # At ~7 m/s and up to 1 s of lag the runner can travel ~7 m,
-                    # so 5 m gives comfortable headroom without merging two people
-                    # who are side-by-side (typical separation on a sprint lane > 1 m).
+                 
                     REID_DIST_M = 5.0
+                    # REID_DIST_M = 100.0 if pure_pixel_mode else 5.0
                     best_old_tid  = None
                     best_old_dist = REID_DIST_M
                     best_is_finished = False
@@ -919,7 +907,8 @@ def main():
                 if dt_frame > 1e-6:
                     prev_wx_m, prev_wy_m = state.prev_wm
                     speed_ms = np.hypot(smoothed_wx - prev_wx_m, smoothed_wy - prev_wy_m) / dt_frame
-                    speed_ms = min(speed_ms, 8.5) # cap at ~30.6 km/h for untrained runners
+                    if not pure_pixel_mode:
+                        speed_ms = min(speed_ms, 7.5)  # cap at 27 km/h — headroom for fast runners
                 else:
                     speed_ms = state.last_speed_ms
 
@@ -966,9 +955,12 @@ def main():
 
             draw_col = col
             if tid not in current_ids:
-                # Record RoI exit on the first frame this track is no longer detected
-                if state.roi_exit_t is None:
-                    state.roi_exit_t = t_now
+                # Only mark RoI exit after a short grace period (0.5 s).
+                # This prevents a single dropped frame from flashing 'done'
+                # and stops the timer from flickering on brief occlusions.
+                gap = t_now - state.last_seen_t
+                if state.roi_exit_t is None and gap > 0.5:
+                    state.roi_exit_t = state.last_seen_t
          
                 dt = t_now - state.prev_t
                 if dt > 0:
@@ -1005,39 +997,103 @@ def main():
                 draw_col = col
                 cv2.rectangle(annotated, (int(bx1), int(by1)), (int(bx2), int(by2)), draw_col, 2)
 
+            # Small ID badge clipped to top-left corner of the box only.
+            # All speed/RoI data is shown in the top-right panel instead.
             if tid in current_ids or (t_now - state.last_seen_t < 1.0):
-                # Label (uses local bx1,by1)
-                label = f"ID {tid}  {disp_kh:.1f}km/h  {state.total_dist:.1f}m"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-                lx  = max(int(bx1), 0)
-                lx  = min(lx, annotated.shape[1] - tw - 8)
-                ly  = max(int(by1) - 8, th + 4)
-                cv2.rectangle(annotated, (lx, ly - th - 4), (lx + tw + 6, ly + 2), draw_col, -1)
-                cv2.putText(annotated, label, (lx + 3, ly - 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+                id_txt = f"ID {tid}"
+                (tw, th), _ = cv2.getTextSize(id_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                lx = max(int(bx1), 0)
+                ly = max(int(by1) - 4, th + 4)
+                cv2.rectangle(annotated, (lx, ly - th - 3), (lx + tw + 4, ly + 2),
+                              (20, 20, 20), -1)
+                cv2.putText(annotated, id_txt, (lx + 2, ly - 1),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_col, 1, cv2.LINE_AA)
 
-                if state.start_crossed and not state.finish_crossed:
-                    elapsed = t_now - state.start_crossed[-1]
-                    cv2.putText(annotated, f"SPRINT {elapsed:.1f}s",
-                                (int(bx1), max(int(by1) - 30, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
-                elif state.finish_crossed:
-                    cv2.putText(annotated, "FINISH",
-                                (int(bx1), max(int(by1) - 30, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 80, 255), 2, cv2.LINE_AA)
+        # ------------------------------------------------------------------
+        # Top-right info panel — speed and/or RoI per subject
+        # ------------------------------------------------------------------
+        panel_rows = []
+        for _tid, _state in sorted(tracks.items()):
+            _is_active = (_tid in current_ids)
+            _spd_kh    = _state.last_disp_kh
+            if _state.roi_exit_t is None:
+                _roi_s   = t_now - _state.roi_entry_t
+                _roi_txt = f"{_roi_s:.2f}s"
+                _roi_col = (0, 230, 140)
+            else:
+                _roi_s   = _state.roi_exit_t - _state.roi_entry_t
+                _roi_txt = f"{_roi_s:.2f}s done"
+                _roi_col = (160, 160, 160)
+            panel_rows.append((_tid, _state.color, _spd_kh, _roi_txt, _roi_col, _is_active))
 
-                # Per-subject RoI timer shown below the label
-                if state.roi_exit_t is None:
-                    roi_elapsed = t_now - state.roi_entry_t
-                    timer_txt   = f"In RoI: {roi_elapsed:.2f}s"
-                    timer_col   = (0, 255, 180)
-                else:
-                    roi_elapsed = state.roi_exit_t - state.roi_entry_t
-                    timer_txt   = f"RoI: {roi_elapsed:.2f}s (done)"
-                    timer_col   = (180, 180, 180)
-                cv2.putText(annotated, timer_txt,
-                            (int(bx1), min(int(by2) + 18, annotated.shape[0] - 4)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, timer_col, 1, cv2.LINE_AA)
+        if panel_rows and (SHOW_SPEED_OVERLAY or SHOW_ROI_OVERLAY):
+            PFONT  = cv2.FONT_HERSHEY_SIMPLEX
+            PFS    = 0.52
+            PFT    = 1
+            PPAD   = 6
+            ROW_H  = 22
+            COL_ID_W  = 52
+            COL_SPD_W = 84
+            COL_ROI_W = 112
+
+            col_widths = [COL_ID_W]
+            if SHOW_SPEED_OVERLAY: col_widths.append(COL_SPD_W)
+            if SHOW_ROI_OVERLAY:   col_widths.append(COL_ROI_W)
+            total_w = sum(col_widths) + PPAD * 2
+            total_h = ROW_H * (len(panel_rows) + 1) + PPAD * 2
+
+            px0 = annotated.shape[1] - total_w - 10
+            py0 = 40
+
+            _ov = annotated.copy()
+            cv2.rectangle(_ov, (px0 - PPAD, py0 - PPAD),
+                          (px0 + total_w, py0 + total_h), (15, 15, 15), -1)
+            cv2.addWeighted(_ov, 0.60, annotated, 0.40, 0, annotated)
+
+            # Header
+            hx = px0
+            cv2.putText(annotated, "ID", (hx + 2, py0 + ROW_H - 6),
+                        PFONT, PFS, (200, 200, 200), PFT, cv2.LINE_AA)
+            hx += col_widths[0]; ci = 1
+            if SHOW_SPEED_OVERLAY:
+                cv2.putText(annotated, "Speed", (hx + 2, py0 + ROW_H - 6),
+                            PFONT, PFS, (200, 200, 200), PFT, cv2.LINE_AA)
+                hx += col_widths[ci]; ci += 1
+            if SHOW_ROI_OVERLAY:
+                cv2.putText(annotated, "RoI Time", (hx + 2, py0 + ROW_H - 6),
+                            PFONT, PFS, (200, 200, 200), PFT, cv2.LINE_AA)
+            div_y = py0 + ROW_H + 2
+            cv2.line(annotated, (px0 - PPAD, div_y), (px0 + total_w, div_y),
+                     (60, 60, 60), 1)
+
+            for row_i, (_tid, _col, _spd_kh, _roi_txt, _roi_col, _is_active) in enumerate(panel_rows):
+                ry = py0 + ROW_H * (row_i + 2) - 4
+                rx = px0
+                _tc = _col if _is_active else tuple(max(0, c - 80) for c in _col)
+
+                cv2.circle(annotated, (rx + 7, ry - 5), 5, _tc, -1)
+                cv2.putText(annotated, f"{_tid}", (rx + 17, ry),
+                            PFONT, PFS, _tc, PFT, cv2.LINE_AA)
+                rx += col_widths[0]; ci = 1
+
+                if SHOW_SPEED_OVERLAY:
+                    if pure_pixel_mode:
+                        _ss = f"{_spd_kh / 3.6:.1f} px/s"
+                    else:
+                        _ss = f"{_spd_kh:.1f} km/h"
+                    if _spd_kh < 10:   _sc = (100, 255, 100)
+                    elif _spd_kh < 20: _sc = (50,  220, 255)
+                    elif _spd_kh < 28: _sc = (0,   165, 255)
+                    else:              _sc = (60,   60,  255)
+                    if not _is_active: _sc = tuple(max(0, c - 80) for c in _sc)
+                    cv2.putText(annotated, _ss, (rx + 2, ry),
+                                PFONT, PFS, _sc, PFT, cv2.LINE_AA)
+                    rx += col_widths[ci]; ci += 1
+
+                if SHOW_ROI_OVERLAY:
+                    _rc = _roi_col if _is_active else tuple(max(0, c - 80) for c in _roi_col)
+                    cv2.putText(annotated, _roi_txt, (rx + 2, ry),
+                                PFONT, PFS, _rc, PFT, cv2.LINE_AA)
 
         t_wall      = time.perf_counter()
         fps_display = 0.9*fps_display + 0.1/max(t_wall-t_fps, 1e-9)
@@ -1067,33 +1123,30 @@ def main():
                     print("  [Gate] Detection", "started." if detection_active else "stopped.")
                 mouse_pos[0] = None
 
-        # --- Global RoI clock ---
-        # Starts when the first subject enters, freezes when all have exited.
-        all_states = list(tracks.values()) + list(finished_tracks.values())
-        entered    = [s for s in all_states if s.roi_entry_t is not None]
-        active     = [s for s in tracks.values() if s.roi_exit_t is None]
-        if entered:
-            global_start = min(s.roi_entry_t for s in entered)
-            if active:
-                # At least one subject still inside — clock runs
-                global_elapsed = t_now - global_start
-                clock_col      = (0, 255, 100)
-                clock_label    = f"RoI Clock: {global_elapsed:.2f}s"
-            else:
-                # Everyone has left — freeze at the last exit time
-                global_elapsed = max(s.roi_exit_t for s in entered) - global_start
-                clock_col      = (100, 200, 255)
-                clock_label    = f"RoI Clock: {global_elapsed:.2f}s  [all out]"
-            # Draw a semi-transparent background pill for the clock
-            (cw, ch), _ = cv2.getTextSize(clock_label, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
-            cx0 = annotated.shape[1] // 2 - cw // 2
-            cy0 = annotated.shape[0] - 44
-            overlay = annotated.copy()
-            cv2.rectangle(overlay, (cx0 - 10, cy0 - ch - 6), (cx0 + cw + 10, cy0 + 6),
-                          (20, 20, 20), -1)
-            cv2.addWeighted(overlay, 0.55, annotated, 0.45, 0, annotated)
-            cv2.putText(annotated, clock_label, (cx0, cy0),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, clock_col, 2, cv2.LINE_AA)
+        # --- Global RoI clock — bottom-right, gated by SHOW_ROI_OVERLAY ---
+        if SHOW_ROI_OVERLAY:
+            _all_st  = list(tracks.values()) + list(finished_tracks.values())
+            _entered = [s for s in _all_st if s.roi_entry_t is not None]
+            _active  = [s for s in tracks.values() if s.roi_exit_t is None]
+            if _entered:
+                _g_start = min(s.roi_entry_t for s in _entered)
+                if _active:
+                    _g_elapsed  = t_now - _g_start
+                    _clock_col  = (0, 255, 100)
+                    _clock_lbl  = f"RoI Clock: {_g_elapsed:.2f}s"
+                else:
+                    _g_elapsed  = max(s.roi_exit_t for s in _entered) - _g_start
+                    _clock_col  = (100, 200, 255)
+                    _clock_lbl  = f"RoI Clock: {_g_elapsed:.2f}s  [all out]"
+                (cw, ch), _ = cv2.getTextSize(_clock_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+                cx0 = annotated.shape[1] - cw - 20
+                cy0 = annotated.shape[0] - 16
+                _ov2 = annotated.copy()
+                cv2.rectangle(_ov2, (cx0 - 8, cy0 - ch - 6), (cx0 + cw + 8, cy0 + 6),
+                              (20, 20, 20), -1)
+                cv2.addWeighted(_ov2, 0.60, annotated, 0.40, 0, annotated)
+                cv2.putText(annotated, _clock_lbl, (cx0, cy0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, _clock_col, 2, cv2.LINE_AA)
 
         if flask_streamer: flask_streamer.push(annotated)
         cv2.imshow("Speed Tracker", annotated)
@@ -1108,7 +1161,6 @@ def main():
     cap.release()
     if writer: writer.release()
     cv2.destroyAllWindows()
-    if mediamtx: mediamtx.stop()
 
     print("\n--- Summary ---")
     for tid in sorted(speed_logs):
@@ -1121,17 +1173,25 @@ def main():
             for sc, fc in zip(state.start_crossed, state.finish_crossed):
                 if fc > sc: times.append(fc - sc)
         t_str = "  ".join(f"{t:.2f}s" for t in times) if times else "--"
-        print(f"  ID {tid:3d}  Peak:{max(spds)*3.6:6.2f}km/h  "
-              f"Avg:{np.mean(spds)*3.6:6.2f}km/h  "
-              f"Dist:{dist:.1f}m  Finishes:{len(finish_events[tid])}  Splits:[{t_str}]")
+        if pure_pixel_mode:
+            print(f"  ID {tid:3d}  Peak:{max(spds):6.2f}px/s  "
+                  f"Avg:{np.mean(spds):6.2f}px/s  "
+                  f"Dist:{dist:.1f}px  Finishes:{len(finish_events[tid])}  Splits:[{t_str}]")
+        else:
+            print(f"  ID {tid:3d}  Peak:{max(spds)*3.6:6.2f}km/h  "
+                  f"Avg:{np.mean(spds)*3.6:6.2f}km/h  "
+                  f"Dist:{dist:.1f}m  Finishes:{len(finish_events[tid])}  Splits:[{t_str}]")
 
     # Find valid IDs to prompt for names
+    _filt_mult = 1.0 if pure_pixel_mode else 3.6
+    _min_spd   = 5.0 if pure_pixel_mode else MIN_GRAPH_SPEED_KMH
+    _min_dst   = 10.0 if pure_pixel_mode else MIN_GRAPH_DIST_M
     valid_tids = []
     for tid, records in speed_logs.items():
         if len(records) >= MIN_GRAPH_FRAMES:
-            speeds_kmh = [r[1] * 3.6 for r in records]
+            speeds_conv = [r[1] * _filt_mult for r in records]
             dist = records[-1][2] if len(records[-1]) > 2 else 0.0
-            if float(np.mean(speeds_kmh)) >= MIN_GRAPH_SPEED_KMH and dist >= MIN_GRAPH_DIST_M:
+            if float(np.mean(speeds_conv)) >= _min_spd and dist >= _min_dst:
                 valid_tids.append(tid)
 
     runner_names = {}
@@ -1180,7 +1240,8 @@ def main():
         root3.mainloop()
 
     generate_speed_graphs(speed_logs, start_events, finish_events,
-                          GRAPH_OUTPUT_TIME, GRAPH_OUTPUT_DIST, vid_fps, runner_names=runner_names)
+                          GRAPH_OUTPUT_TIME, GRAPH_OUTPUT_DIST, vid_fps,
+                          runner_names=runner_names, pure_pixel_mode=pure_pixel_mode)
     if VIDEO_OUTPUT and os.path.exists(VIDEO_OUTPUT):
         print(f"  Video -> {VIDEO_OUTPUT}")
 
